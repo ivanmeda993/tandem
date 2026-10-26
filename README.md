@@ -6,6 +6,7 @@ Tandem is an independent project. It is not made, endorsed or supported by Anthr
 
 ## Why Tandem
 
+- **Built on the apps you already use, not a new one.** Tandem builds no agent, chat window, editor or sandbox of its own. The work is done by Claude Code and Codex themselves, each with its own models, tools, plugins, MCP servers and sandbox; you watch and write in the Claude and Codex desktop apps; each worker is isolated by a plain git worktree; reviews reach GitHub through `gh`; and notifications are macOS's own. Tandem is the thin layer that connects them, so you keep what each app does best, and their own updates and fixes come with them.
 - **Two vendors check each other.** Claude and Codex are trained differently and miss different things. Tandem has one write and the other review, so a bug one model is blind to has a second chance to be caught.
 - **Each agent in the app you already use.** Claude's messages run in your Codex thread as new turns, so you watch them live in the Codex app, and Codex's answers come straight back into Claude's conversation. There is nothing new to open and no copying between windows.
 - **Parallel work without collisions.** In an orchestrated run, every task gets its own git worktree, branch and Codex thread. Tasks that would change the same files wait for each other, so workers never overwrite one another.
