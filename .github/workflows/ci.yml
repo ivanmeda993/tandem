@@ -1,0 +1,17 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  core:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Shell syntax (bash 3.2)
+        run: /bin/bash -n codex-skills/ask-claude/scripts/ask-claude.sh && /bin/bash -n codex-skills/tandem/scripts/tandem
+      - name: Core tests
+        run: python -m unittest discover -s tests -v

@@ -1,0 +1,26 @@
+{
+  "name": "tandem",
+  "version": "0.1.0",
+  "description": "Live conversation between Codex and Claude Code, and orchestrated runs of Codex workers: answer Claude's messages in your thread, start one with Claude, ask Claude for a second opinion, or orchestrate a goal.",
+  "author": {
+    "name": "Ivan Milicevic"
+  },
+  "license": "MIT",
+  "keywords": [
+    "claude",
+    "multi-agent",
+    "collaboration",
+    "orchestration"
+  ],
+  "skills": "./codex-skills/",
+  "interface": {
+    "displayName": "Tandem",
+    "shortDescription": "Talk live with Claude Code and orchestrate Codex workers",
+    "longDescription": "Claude's messages run in your Codex thread as new turns, and your answers go straight back to Claude. Codex can also start a conversation with Claude, ask it for a second opinion, or orchestrate a goal: it plans the tasks, Tandem runs a Codex worker for each in its own git worktree, and Codex reviews their work while you approve the plan and every merge. Everything runs locally through the official Codex and Claude Code command-line tools signed in with your own subscriptions.",
+    "developerName": "Ivan Milicevic",
+    "category": "Coding",
+    "brandColor": "#0F6E56",
+    "logo": "./assets/icon.png",
+    "composerIcon": "./assets/icon.png"
+  }
+}

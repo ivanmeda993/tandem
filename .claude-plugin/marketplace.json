@@ -1,0 +1,14 @@
+{
+  "name": "tandem",
+  "owner": {
+    "name": "Ivan Milicevic"
+  },
+  "description": "Tandem: live conversation between Claude Code and Codex.",
+  "plugins": [
+    {
+      "name": "tandem",
+      "source": "./",
+      "description": "Live conversation between Claude Code and Codex, and orchestrated runs of Codex workers, with a side panel in Claude."
+    }
+  ]
+}

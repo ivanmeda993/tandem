@@ -1,0 +1,28 @@
+{
+  "name": "tandem",
+  "interface": {
+    "displayName": "Tandem"
+  },
+  "owner": {
+    "name": "Ivan Milicevic"
+  },
+  "plugins": [
+    {
+      "name": "tandem",
+      "description": "Talk live with Claude Code and orchestrate Codex workers",
+      "source": "./",
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "version": "0.1.0",
+      "category": "Coding",
+      "tags": [
+        "multi-agent",
+        "collaboration",
+        "claude",
+        "orchestration"
+      ]
+    }
+  ]
+}

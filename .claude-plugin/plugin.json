@@ -1,0 +1,18 @@
+{
+  "name": "tandem",
+  "version": "0.1.0",
+  "description": "Live conversation between Claude Code and a Codex thread, and orchestrated runs where one session plans and reviews while Codex workers build in their own git worktrees, with a side panel in Claude.",
+  "author": {
+    "name": "Ivan Milicevic"
+  },
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "multi-agent",
+    "collaboration",
+    "panel"
+  ],
+  "icon": "./assets/icon.png",
+  "types": "./types/index.d.ts",
+  "hooks": "./mod/hooks.json"
+}

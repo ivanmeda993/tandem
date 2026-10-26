@@ -1,0 +1,16 @@
+# Security
+
+Tandem runs only on your machine, through the official Claude Code and Codex command-line tools. The README's section "What Tandem runs, reads and writes" lists every command it runs and every file it reads or writes.
+
+Please report a vulnerability privately through GitHub's "Report a vulnerability" button on this repository rather than in a public issue.
+
+Known boundaries:
+
+- Messages between the agents are text one AI agent wrote for another. Tandem labels them, but an agent can still be misled by what the other sends, so keep approvals on for anything risky.
+- `ask-claude` consult mode denies edits, other shell commands, the web and common secret files, but Claude can still read other files in your home folder. Use it in projects you trust.
+- The message limit is enforced by the core script; the person raises it from the Tandem panel. An agent with shell access could edit the room files directly, so the limit is a guardrail, not a security boundary.
+- The same holds for an orchestrated run's gates (approving the plan, merging, picking proposals, accepting or cancelling a task, stopping the run, raising the budget, cleaning up): the panel's buttons call them. The orchestrator's own tools offer none of them, `orch stop` refuses a task that waits for your decision, and approving takes only the tasks the panel showed you, but an agent with shell access could call the commands too. By default workers run like your regular Codex threads, with full access and approvals off; you can sandbox them to their worktree or to reading when you set up the run. Workers that run in the Codex app get the app's own sandbox and approvals for their thread, so Tandem keeps read-only roles and sandboxed runs in the background, where their sandbox applies. The optional setup command runs outside any sandbox, as you, once you approve the plan that shows it.
+- A turn that needs Tandem's sandbox (a review, a read-only role, a run sandboxed to its worktrees) or an answer's schema is never queued into a Codex app or CLI that has the thread open, because that app would run it with its own settings and without `TANDEM_SPAWNED`; Tandem refuses and says why.
+- Archiving from Tandem tells a running Codex app with the notice the app's own windows send one another, which is not a public interface. If an app update changes it, the app keeps listing the threads Tandem archived until you archive them there too; Codex has them archived either way.
+- `ask_thread` forks a thread read-only with plugins, apps and the MCP servers named in your Codex config and the project's `.codex/config.toml` switched off (a server Codex finds elsewhere, such as in a profile, is not), so the fork cannot call tools that write elsewhere (Figma, GitHub, computer use).
+- A review thread runs in Codex's read-only sandbox, but a pull request's description and code are written by whoever opened it and reach Codex as text to read; Codex's findings are claims that Claude checks in the code. Posting to GitHub needs your press and confirmation in the panel, and posts only the findings you ticked.
