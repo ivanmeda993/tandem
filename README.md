@@ -4,6 +4,18 @@ Tandem lets Claude Code and Codex talk to each other live, each in the session y
 
 Tandem is an independent project. It is not made, endorsed or supported by Anthropic or OpenAI. The Claude and Codex icons in its panel are those apps' own icons (`assets/agent-*.png`), shown only to say which agent does what; they belong to their owners. It works with Claude Code and Codex through their own command-line tools, signed in with your own subscriptions.
 
+## Why Tandem
+
+- **Two vendors check each other.** Claude and Codex are trained differently and miss different things. Tandem has one write and the other review, so a bug one model is blind to has a second chance to be caught.
+- **Each agent in the app you already use.** Claude's messages run in your Codex thread as new turns, so you watch them live in the Codex app, and Codex's answers come straight back into Claude's conversation. There is nothing new to open and no copying between windows.
+- **Parallel work without collisions.** In an orchestrated run, every task gets its own git worktree, branch and Codex thread. Tasks that would change the same files wait for each other, so workers never overwrite one another.
+- **You stay in charge.** Workers start only after you approve the plan, and nothing reaches your branch until you click Merge. Tandem never pushes, and every worker turn counts against a budget only you raise.
+- **Reviews that hold up.** Codex reviews a pull request, a branch or your uncommitted changes, read-only, against the project's own rules (`AGENTS.md`, `CLAUDE.md`). Claude checks each finding in the code before you hear of it, and only the findings you pick are posted to GitHub.
+- **It survives long runs.** A run lives on disk, so a Mac restart, a killed process or Claude compacting its conversation does not lose it, and the orchestrator gets the run's state and its own notes back.
+- **Local and on your own plans.** There is no server and no extra account. Everything runs through the official `claude` and `codex` command-line tools, signed in with your own subscriptions.
+
+To try it where nothing is at stake, use the demo project [ivanmeda993/tandem-demo](https://github.com/ivanmeda993/tandem-demo): a tiny reading-list app whose README walks through a conversation, a review of a branch with real bugs, and two orchestrated runs.
+
 ## What you get
 
 **In Claude Code** (terminal and the Code tab of the Claude desktop app):
@@ -47,7 +59,7 @@ codex plugin marketplace add ivanmeda993/tandem
 
 then install Tandem from Plugins in the Codex desktop app, or with `codex plugin add tandem@tandem`.
 
-Check the setup with `codex-skills/tandem/scripts/tandem doctor`.
+Check the setup with `codex-skills/tandem/scripts/tandem doctor`. To try Tandem first, clone [the demo project](https://github.com/ivanmeda993/tandem-demo) and follow its README.
 
 ## Use
 
