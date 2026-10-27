@@ -318,6 +318,7 @@ const RUN = {
   budget: { used: 0, limit: 40 },
   workers: { model: null, effort: 'high', max_parallel: 2, access: 'worktree', where: 'app' },
   simplify: true,
+  auto_merge: false,
   setup_command: null,
   copy: [],
   codex_quota: null,
@@ -866,6 +867,31 @@ test('the user picks which simplifier proposals the worker applies', async ($, o
 
   const applied = calls.find(c => c.argv[2] === 'apply')
   expect(applied?.argv[(applied?.argv.indexOf('--items') ?? 0) + 1]).toBe('2')
+})
+
+test('a run with auto merge says Tandem merged what the person let through, and Claude hears what a merge started', async ($, on) => {
+  const clock = engine(on)
+  const proposing = {
+    ...RUN,
+    status: 'running',
+    auto_merge: true,
+    tasks: [{ ...TASK, status: 'proposals', phase: 'simplified', proposals: [{ id: 1, kind: 'delete', where: 'a.ts:3', why: 'unused helper', lines_removed: 4 }] }],
+  }
+  const merged = { ...proposing, tasks: [{ ...proposing.tasks[0], status: 'merged' }] }
+  orchCore(on, [{ run: proposing, events: [] }], {
+    apply: () => ok(JSON.stringify({ ok: true, text: "The user skipped the simplifier's proposals for a; Merged a into tandem/r-test1.", run: merged })),
+    review: () => ok(JSON.stringify({ ok: true, text: 'b approved. Merged b into tandem/r-test1.', events: [{ type: 'notice', text: 'Out of worker turns.' }], run: merged })),
+  })
+  await startRun($, clock)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'skip-a' })
+  await clock.advance(0)
+  expect(await shown(ui)).toContain('Kept “Theme tokens” as it is. Tandem merged it into tandem/r-test1.')
+  await ui.unmount()
+  const reviewed = JSON.stringify(await $.tool.call({ tool: 'mcp__tandem__orch_review', task: 'b', verdict: 'approve' }))
+  expect(reviewed).toContain('Merged b into tandem/r-test1.')
+  expect(reviewed).toContain('Out of worker turns.')
 })
 
 test('a run a Codex thread conducts is shown to answer there, not decided here', async ($, on) => {

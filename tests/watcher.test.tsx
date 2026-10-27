@@ -18,6 +18,7 @@ const RUN = {
   budget: { used: 1, limit: 40 },
   workers: { model: null, effort: 'high', max_parallel: 2, access: 'full', where: 'app' },
   simplify: false,
+  auto_merge: false,
   setup_command: null,
   copy: [],
   codex_quota: null,

@@ -67,6 +67,7 @@ DEFAULT_SETUP = {
     "preset": "claude-plans-codex-builds",
     "workers": {"model": None, "effort": "high", "max_parallel": 2, "access": "full", "where": "app"},
     "simplify": True,
+    "auto_merge": True,
     "fix_rounds": 2,
     "budget": 40,
     "setup_command": None,
@@ -203,8 +204,9 @@ def merged_setup(given):
     for key in ("fix_rounds", "budget"):
         if not isinstance(setup[key], int) or setup[key] < 0:
             core.fail(f"{key} must be a whole number")
-    if not isinstance(setup["simplify"], bool):
-        core.fail("simplify is true or false")
+    for key in ("simplify", "auto_merge"):
+        if not isinstance(setup[key], bool):
+            core.fail(f"{key} is true or false")
     if not isinstance(setup["copy"], list) or any(not isinstance(p, str) or not safe_path(p) for p in setup["copy"]):
         core.fail("copy lists paths inside the project, such as .env.local")
     return setup
@@ -489,7 +491,7 @@ def end_turn(run, task, event):
     if task["status"] == "stopping":
         task["status"] = "cancelled"
     elif event["type"] == "aborted" and task.get("phase") == "simplify":
-        # The change was approved; only its simplification is lost. It waits for the user's Merge as it is.
+        # The change was approved; only its simplification is lost. It is merged as it is (with auto merge off, by the user).
         skip_simplifier(run, task, f"The simplifier could not finish ({clip(event['text'], 300)}), so the change was not "
                                    "simplified.")
     elif event["type"] == "aborted":
@@ -750,6 +752,9 @@ def digest_text(run, tasks, root):
             body = (f"{head} · the simplifier proposes (it changed nothing):\n{items}\nShow these to the user and ask which "
                     "to apply; then run " + command(root, f"apply --run {run['id']} --task {task['id']} --items 1,3")
                     + " with their numbers, or without --items to skip them all.")
+        elif status == "approved" and task.get("merge_failed"):
+            body = f"{head} · approved, but {task.get('error', '')}" + say(
+                run, "", " Ask the user, then run: " + command(root, f"merge --run {run['id']} --task {task['id']}"))
         elif status == "approved":
             body = (f"{head} · the simplifier found nothing to simplify; it is ready to merge. Ask the user, then run: "
                     + command(root, f"merge --run {run['id']} --task {task['id']}"))
@@ -762,7 +767,8 @@ def digest_text(run, tasks, root):
                 "ask the user whether to accept it as it is (" + command(root, f"accept --run {run['id']} --task {task['id']}")
                 + ") or cancel it (" + command(root, f"cancel --run {run['id']} --task {task['id']}") + ").")
         elif status == "merged":
-            body = f"{head} · merged by the user into {run['integration']['branch']}"
+            body = (f"{head} · merged into {run['integration']['branch']} "
+                    + ("by Tandem (the run merges approved work on its own)" if task.get("merged_by") == "tandem" else "by the user"))
         else:
             body = f"{head} · {status}"
         if task.get("messages"):
@@ -772,13 +778,14 @@ def digest_text(run, tasks, root):
     if running:
         parts.append("Still running: " + ", ".join(f"{t['id']} ({minutes(t)} min)" for t in running))
     if any(task["status"] == "reported" for task in tasks):
+        merging = "Tandem merges approved tasks into the run's branch on its own." if run["setup"].get("auto_merge") else None
         parts.append(say(
             run, "Next: read each reported task's diff with orch_diff, then decide with orch_review: approve, or "
-                 "changes with concrete notes. Approved tasks wait for the user's Merge click in the panel.",
+                 "changes with concrete notes. " + (merging or "Approved tasks wait for the user's Merge click in the panel."),
             "Next: for each reported task, read its diff (" + command(root, f"diff --run {run['id']} --task <id>") + "). "
             "For a review from the other vendor, ask Claude with the ask-claude skill (read-only), giving it the diff, the "
             "brief and the acceptance criteria. Then decide: " + command(root, f"review --run {run['id']} --task <id> --verdict approve")
-            + ", or the same with --verdict changes --notes \"…\". Ask the user before you merge an approved task."))
+            + ", or the same with --verdict changes --notes \"…\". " + (merging or "Ask the user before you merge an approved task.")))
     return "\n\n".join(parts)
 
 
@@ -1010,7 +1017,8 @@ def view(root, run):
                                                                "limit": run["setup"]["budget"]},
             "workers": {"model": workers["model"], "effort": workers["effort"], "max_parallel": workers["max_parallel"],
                         "access": workers["access"], "where": workers.get("where", "background")},
-            "simplify": bool(run["setup"].get("simplify")), "setup_command": run["setup"].get("setup_command"),
+            "simplify": bool(run["setup"].get("simplify")), "auto_merge": bool(run["setup"].get("auto_merge")),
+            "setup_command": run["setup"].get("setup_command"),
             "copy": run["setup"].get("copy") or [],
             "codex_quota": codex_quota(root), "orchestrator": run.get("orchestrator") or {"vendor": "claude"},
             "conductor": conductor_alive(root, run["id"]) if by_codex(run) else None, "tasks": tasks,
@@ -1148,6 +1156,8 @@ def advance(root, run):
         # A task that reported before Tandem kept the files it changed gets them once, for the panel's summary.
         elif task["status"] in ("reported", "approved", "proposals") and "files" not in task and task.get("worktree"):
             task["files"] = changed_files(task)
+    for task, _ in merge_approved(root, run):
+        note_for_digest(run, task)
     events = dispatch_ready(root, run)
     events += digest_events(run, root)
     if run["status"] == "running" and run["tasks"] and all(t["status"] in FINISHED for t in run["tasks"]):
@@ -1332,6 +1342,9 @@ def cmd_review(args, root):
                         "nothing); " + say(run, "the user picks which to apply in the panel",
                                            "Tandem sends you its proposals for the user to pick")
                         + ", the worker applies them, and you review the result once more.")
+            elif run["setup"].get("auto_merge"):
+                task.update(status="approved", review=notes)
+                text = f"{task['id']} approved. " + merged_now(root, run)
             else:
                 task.update(status="approved", review=notes)
                 text = f"{task['id']} approved; " + say(
@@ -1361,7 +1374,8 @@ def cmd_review(args, root):
             run["counters"]["fixes"] += 1
             text = f"Sent the changes to the worker of {task['id']}; its report arrives in the next digest."
         log_event(root, run, "review", text, task=task["id"])
-    emit({"ok": True, "text": text, "run": view(root, run)})
+        events = dispatch_ready(root, run)
+    emit({"ok": True, "text": text, "events": events, "run": view(root, run)})
 
 
 def cmd_apply(args, root):
@@ -1374,7 +1388,8 @@ def cmd_apply(args, root):
         picked = [item for item in task.get("proposals") or [] if item["id"] in chosen]
         if not picked:
             task["status"] = "approved"
-            text = f"The user skipped the simplifier's proposals for {task['id']}; it is ready to merge."
+            text = f"The user skipped the simplifier's proposals for {task['id']}; " + (
+                merged_now(root, run) if run["setup"].get("auto_merge") else "it is ready to merge.")
         elif budget_left(run) <= 0:
             out_of_budget(root, run)
         else:
@@ -1385,7 +1400,8 @@ def cmd_apply(args, root):
             text = (f"The user picked {len(picked)} of the simplifier's proposals for {task['id']}; its worker applies "
                     "them, and you review the result in a coming digest.")
         log_event(root, run, "apply", text, task=task["id"])
-    emit({"ok": True, "text": text, "run": view(root, run)})
+        events = dispatch_ready(root, run)
+    emit({"ok": True, "text": text, "events": events, "run": view(root, run)})
 
 
 def cmd_send(args, root):
@@ -1433,53 +1449,81 @@ def commit_task(run, task):
                                                  f"Tandem-Worker: codex {task.get('model') or 'default'} {task.get('effort') or 'default'}")
 
 
+def merge_task(root, run, task, by="user"):
+    """Commit the task's work and merge it into the run's branch; returns (ok, text)."""
+    integration = run["integration"]["worktree"]
+    try:
+        commit_task(run, task)
+    except ConflictMarkers as error:
+        # Back to the orchestrator, which has the worker resolve them (without using a fix round).
+        task.update(status="conflict", conflict=error.files)
+        note_for_digest(run, task)
+        text = f"{task['id']} still has conflict markers in {', '.join(error.files)}; the orchestrator gets it back to resolve."
+        log_event(root, run, "merge", text, task=task["id"])
+        return False, text
+    except GitError as error:
+        return False, f"Could not commit {task['id']}'s work: {error}"
+    merged = run_git(integration, *NO_HOOKS, "merge", "--no-ff", "--no-edit", "-m",
+                     f"Tandem: {task['title']} ({task['id']})", task["branch"])
+    if merged.returncode != 0:
+        conflicted = run_git(integration, "diff", "--name-only", "--diff-filter=U").stdout.split()
+        run_git(integration, "merge", "--abort")
+        if not conflicted:  # not a conflict: say what git said
+            text = f"Could not merge {task['id']}: {clip(merged.stderr or merged.stdout, 600)}"
+        else:
+            # Bring the merged work into the task's branch: a clean merge is ready to try again; otherwise the
+            # conflict markers stay in the worktree for the worker to resolve. From here the task's change is what
+            # it adds to the run's branch, so its diff, review and simplifier read it against that branch.
+            latest = git(integration, "rev-parse", "HEAD")
+            if run_git(task["worktree"], *NO_HOOKS, "merge", "--no-edit", run["integration"]["branch"]).returncode == 0:
+                task["base"] = latest
+                text = f"{task['id']} needed the run's latest work first; Tandem merged it into the task. Click Merge again."
+            else:
+                files = run_git(task["worktree"], "diff", "--name-only", "--diff-filter=U").stdout.split()
+                task.update(status="conflict", conflict=files, error=(merged.stderr or merged.stdout)[-500:], base=latest)
+                note_for_digest(run, task)
+                text = f"{task['id']} conflicts with merged work in {', '.join(files) or 'some files'}; the orchestrator gets it to resolve."
+        log_event(root, run, "merge", text, task=task["id"])
+        return False, text
+    task.update(status="merged", merged=git(integration, "rev-parse", "HEAD"), merged_by=by)
+    task.pop("merge_failed", None)
+    log_event(root, run, "merge", f"{task['id']} merged" + (" by Tandem" if by == "tandem" else ""), task=task["id"])
+    return True, f"Merged {task['id']} into {run['integration']['branch']}."
+
+
+def merge_approved(root, run):
+    """A run with auto_merge merges each approved task itself, as the user's Merge click would; a conflict goes back to
+    the orchestrator the same way. A task Tandem could not merge otherwise waits for the user's Merge. Returns
+    [(task, text)] for the tasks it tried."""
+    if not run["setup"].get("auto_merge"):
+        return []
+    tried = []
+    for task in run["tasks"]:
+        if task["status"] != "approved" or task.get("merge_failed"):
+            continue
+        ok, text = merge_task(root, run, task, by="tandem")
+        if not ok and task["status"] == "approved":  # it may only have needed the run's latest work, which it has now
+            ok, text = merge_task(root, run, task, by="tandem")
+        if not ok and task["status"] == "approved":
+            text = text.replace(" Click Merge again.", "") + " It waits for the user's Merge in the panel."
+            task.update(merge_failed=True, error=text)
+        tried.append((task, text))
+    return tried
+
+
+def merged_now(root, run):
+    """What merge_approved did, for the reply to the command that approved the task."""
+    return " ".join(text for _, text in merge_approved(root, run))
+
+
 def cmd_merge(args, root):
     with locked_run(root, args.run) as run:
         task = find_task(run, args.task)
         if task["status"] != "approved":
             core.fail(f"task {task['id']} is {task['status']}; only approved tasks are merged")
-        integration = run["integration"]["worktree"]
-        try:
-            commit_task(run, task)
-        except ConflictMarkers as error:
-            # Back to the orchestrator, which has the worker resolve them (without using a fix round).
-            task.update(status="conflict", conflict=error.files)
-            note_for_digest(run, task)
-            text = f"{task['id']} still has conflict markers in {', '.join(error.files)}; the orchestrator gets it back to resolve."
-            log_event(root, run, "merge", text, task=task["id"])
-            emit({"ok": False, "text": text, "run": view(root, run)})
-            return
-        except GitError as error:
-            emit({"ok": False, "text": f"Could not commit {task['id']}'s work: {error}", "run": view(root, run)})
-            return
-        merged = run_git(integration, *NO_HOOKS, "merge", "--no-ff", "--no-edit", "-m",
-                         f"Tandem: {task['title']} ({task['id']})", task["branch"])
-        if merged.returncode != 0:
-            conflicted = run_git(integration, "diff", "--name-only", "--diff-filter=U").stdout.split()
-            run_git(integration, "merge", "--abort")
-            if not conflicted:  # not a conflict: say what git said
-                text = f"Could not merge {task['id']}: {clip(merged.stderr or merged.stdout, 600)}"
-            else:
-                # Bring the merged work into the task's branch: a clean merge is ready to try again; otherwise the
-                # conflict markers stay in the worktree for the worker to resolve. From here the task's change is what
-                # it adds to the run's branch, so its diff, review and simplifier read it against that branch.
-                latest = git(integration, "rev-parse", "HEAD")
-                if run_git(task["worktree"], *NO_HOOKS, "merge", "--no-edit", run["integration"]["branch"]).returncode == 0:
-                    task["base"] = latest
-                    text = f"{task['id']} needed the run's latest work first; Tandem merged it into the task. Click Merge again."
-                else:
-                    files = run_git(task["worktree"], "diff", "--name-only", "--diff-filter=U").stdout.split()
-                    task.update(status="conflict", conflict=files, error=(merged.stderr or merged.stdout)[-500:], base=latest)
-                    note_for_digest(run, task)
-                    text = f"{task['id']} conflicts with merged work in {', '.join(files) or 'some files'}; the orchestrator gets it to resolve."
-            log_event(root, run, "merge", text, task=task["id"])
-            emit({"ok": False, "text": text, "run": view(root, run)})
-            return
-        task.update(status="merged", merged=git(integration, "rev-parse", "HEAD"))
-        events = dispatch_ready(root, run)
-        log_event(root, run, "merge", f"{task['id']} merged", task=task["id"])
-    emit({"ok": True, "text": f"Merged {task['id']} into {run['integration']['branch']}.", "events": events,
-          "run": view(root, run)})
+        ok, text = merge_task(root, run, task)
+        events = dispatch_ready(root, run) if ok else []
+    emit({"ok": ok, "text": text, "events": events, "run": view(root, run)})
 
 
 def in_app_note(tasks):
@@ -1503,7 +1547,8 @@ def cmd_stop(args, root):
                     os.killpg(task["runner_pid"], signal.SIGTERM)
             skip_simplifier(run, task, "The simplifier was stopped, so the change was not simplified.")
             log_event(root, run, "stop", f"{task['id']} simplifier")
-            text = f"Stopped the simplifier of {task['id']}; the approved change waits for the user's Merge as it is."
+            text = f"Stopped the simplifier of {task['id']}; " + (
+                merged_now(root, run) if run["setup"].get("auto_merge") else "the approved change waits for the user's Merge as it is.")
         else:
             targets = [task] if task else [t for t in run["tasks"] if t["status"] not in FINISHED]
             in_app = [target for target in targets if not stop_task(root, target)]
@@ -1524,7 +1569,8 @@ def cmd_user_task(args, root):
                 core.fail(f"task {task['id']} is {task['status']}")
             read_only = writes_nothing(run, task, roles())
             task["status"] = "done" if read_only else "approved"
-            text = f"The user accepted {task['id']} as it is" + ("." if read_only else "; it is ready to merge.")
+            text = f"The user accepted {task['id']} as it is" + (
+                "." if read_only else "; " + (merged_now(root, run) if run["setup"].get("auto_merge") else "it is ready to merge."))
         else:
             if task["status"] in FINISHED:
                 core.fail(f"task {task['id']} is already {task['status']}")

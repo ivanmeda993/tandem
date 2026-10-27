@@ -35,6 +35,7 @@ class OrchHelpers:
 
     def start(self, **setup):
         setup.setdefault("simplify", False)
+        setup.setdefault("auto_merge", False)  # most tests merge by hand, as the user's click
         return json.loads(self.orch("init", "--goal", "Say hello", "--setup", json.dumps(setup)).stdout)["run"]["id"]
 
     def plan(self, run, tasks, ok=True):
@@ -230,6 +231,59 @@ class OrchTests(OrchHelpers, Base):
         blocked = self.act("review", run, "--task", "a", "--verdict", "changes", "--notes", "more")
         self.assertEqual(self.status(blocked["run"], "a"), "blocked")
         self.assertEqual(self.status(self.act("accept", run, "--task", "a")["run"], "a"), "approved")
+
+    def test_approved_tasks_merge_on_their_own_by_default(self):
+        started = json.loads(self.orch("init", "--goal", "Say hello", "--setup", json.dumps({"simplify": False})).stdout)
+        run = started["run"]["id"]
+        self.assertTrue(started["run"]["auto_merge"])
+        self.plan(run, [task("a"), task("b", deps=["a"])])
+        self.act("approve", run)
+        self.poll_until(run, lambda v, e: self.status(v, "a") == "reported")
+        approved = self.act("review", run, "--task", "a", "--verdict", "approve")
+        self.assertIn(f"Merged a into tandem/{run}", approved["text"])
+        self.assertEqual(self.status(approved["run"], "a"), "merged")
+        self.assertEqual(self.status(approved["run"], "b"), "running")  # what waited for a starts at once
+        self.poll_until(run, lambda v, e: self.status(v, "b") == "reported")
+        self.act("review", run, "--task", "b", "--verdict", "approve")
+        view, events = self.poll_until(run, lambda v, e: any(x["type"] == "done" for x in e))
+        self.assertEqual(self.git("show", f"tandem/{run}:b.txt"), "hello from b")
+        self.assertEqual([t.get("merged_by") for t in self.run_json(run)["tasks"]], ["tandem", "tandem"])
+
+    def test_auto_merge_after_the_simplifier_and_on_a_conflict(self):
+        run = self.start(simplify=True, auto_merge=True)
+        self.plan(run, [task("a", brief="WRITE same.txt from a", owns=["one"]),
+                        task("b", brief="WRITE same.txt from b", owns=["two"])])
+        self.act("approve", run)
+        self.poll_until(run, lambda v, e: self.status(v, "a") == "reported" and self.status(v, "b") == "reported")
+        for task_id in ("a", "b"):
+            self.act("review", run, "--task", task_id, "--verdict", "approve")
+        self.poll_until(run, lambda v, e: self.status(v, "a") == "proposals" and self.status(v, "b") == "proposals")
+        skipped = self.act("apply", run, "--task", "a")  # the user's pick still comes first
+        self.assertIn("Merged a", skipped["text"])
+        conflict = self.act("apply", run, "--task", "b")
+        self.assertEqual(self.status(conflict["run"], "b"), "conflict")
+        self.act("review", run, "--task", "b", "--verdict", "changes", "--notes", "WRITE same.txt resolved")
+        self.poll_until(run, lambda v, e: self.status(v, "b") == "reported")
+        self.assertIn("Merged b", self.act("review", run, "--task", "b", "--verdict", "approve")["text"])
+        self.assertEqual(self.git("show", f"tandem/{run}:same.txt"), "resolved")
+
+    def test_a_task_tandem_could_not_merge_waits_for_the_user(self):
+        run = self.start(auto_merge=True)
+        self.plan(run, [task("a")])
+        self.act("approve", run)
+        self.poll_until(run, lambda v, e: self.status(v, "a") == "reported")
+        integration = os.path.join(self.repo, ".tandem", "worktrees", f"{run}-integration")
+        with open(os.path.join(integration, "a.txt"), "w") as f:  # an untracked file the merge would overwrite
+            f.write("local\n")
+        approved = self.act("review", run, "--task", "a", "--verdict", "approve")
+        self.assertIn("Could not merge a", approved["text"])
+        self.assertIn("waits for the user's Merge", approved["text"])
+        view = json.loads(self.orch("poll", "--run", run).stdout)["run"]  # a poll does not try again
+        self.assertEqual(self.status(view, "a"), "approved")
+        self.assertIn("Could not merge a", next(t["error"] for t in view["tasks"]))
+        os.remove(os.path.join(integration, "a.txt"))
+        self.assertIn("Merged a", self.act("merge", run, "--task", "a")["text"])
+        self.assertEqual(self.run_json(run)["tasks"][0]["merged_by"], "user")
 
     def test_merge_conflict_goes_back_to_the_worker(self):
         run = self.start(fix_rounds=0)  # resolving a conflict Tandem's merge caused uses no fix round
@@ -706,7 +760,8 @@ class CodexOrchestratorTests(OrchHelpers, Base):
         self.fail(f"no update with {needle!r}: {self.updates()}")
 
     def test_codex_orchestrates_and_gets_updates_in_its_thread(self):
-        started = json.loads(self.orch("init", "--goal", "Say hello", "--setup", json.dumps({"simplify": True})).stdout)
+        started = json.loads(self.orch("init", "--goal", "Say hello", "--setup",
+                                       json.dumps({"simplify": True, "auto_merge": False})).stdout)
         run = started["run"]["id"]
         self.runs.append(run)
         self.assertEqual((started["run"]["orchestrator"]["vendor"], started["run"]["conductor"]), ("codex", True))

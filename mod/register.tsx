@@ -92,7 +92,8 @@ const SETUP_QUESTIONS =
   '- Where workers run: in the Codex app (recommended: the user watches each worker live and can write in its thread; the ' +
   "app's own model and effort settings may apply) · in the background (the run's effort applies; the Codex app shows them " +
   'only while a turn runs).\n' +
-  'Ask one more question if it matters for the goal: a simplification pass after your review (recommended: on), a setup command ' +
+  'Ask one more question if it matters for the goal: a simplification pass after your review (recommended: on), merging ' +
+  "approved tasks into the run's branch on their own (recommended: on; off, each waits for the user's Merge click), a setup command " +
   'for each worktree (such as npm ci), or git-ignored files to copy into worktrees (such as .env.local).'
 
 // The panel shows a run that another session or a Codex thread conducts: this session's orchestrator tools leave it alone.
@@ -741,7 +742,9 @@ async function orchestratorGuide($: Engine): Promise<string> {
     "approve, or changes with concrete notes (the worker gets them as its next turn; after the run's fix rounds the user " +
     'decides). When the run has the simplification pass on, approving a task that changed code sends it to a fresh ' +
     'simplifier that only proposes; the user picks proposals in the panel, the worker applies them, and you review the ' +
-    "result once more. Approved tasks wait for the user's Merge click; you never merge.\n" +
+    "result once more. A run with auto merge on (the default) merges each approved task into the run's branch itself, and a " +
+    "merge conflict comes back to you to have its worker resolve; with it off, approved tasks wait for the user's Merge " +
+    'click. You never merge.\n' +
     '3. Tasks whose role runs on Claude are yours: do them in this session, a linked session or a subagent, then call orch_done.\n' +
     "4. When every task is merged, the work is on the run's branch (tandem/<run>). Summarize the run for the user; they merge " +
     'that branch into theirs themselves.\n' +
@@ -1096,6 +1099,14 @@ async function decide($: Engine, decision: Decision): Promise<void> {
   })
 }
 
+// What became of a task the person let through (kept as it was, accepted): a run with auto merge has merged it already.
+function landed(after: RunView | null, task: TaskView): string {
+  const now = after?.tasks.find(t => t.id === task.id)
+  if (now?.status === 'merged') return `Tandem merged it into ${after?.branch}.`
+  if (now?.status === 'conflict') return 'It conflicts with work already merged, so its worker resolves that first.'
+  return now?.status === 'approved' ? 'Merge it when you are ready.' : ''
+}
+
 async function mergeAll($: Engine): Promise<void> {
   await act($, 'merge-all', 'run', async () => {
     const current = await read($, run)
@@ -1153,12 +1164,12 @@ async function applyPicks($: Engine, task: TaskView, skip: boolean): Promise<voi
     verb: 'apply',
     args: ['--task', task.id, ...(chosen.length > 0 ? ['--items', chosen.join(',')] : [])],
     tell: true,
-    done: () => {
+    done: after => {
       // Only once the core took them: after a failure the person's picks stay ticked for another try.
       inBackground(update($, picks, all => ({ ...all, [task.id]: [] })))
       return chosen.length > 0
         ? `Sent ${plural(chosen.length, 'change')} to the worker of ${quote(task.title)}. Claude reviews the result.`
-        : `Kept ${quote(task.title)} as it is. It is ready to merge.`
+        : `Kept ${quote(task.title)} as it is. ${landed(after, task)}`.trim()
     },
     failed: `Could not answer the simplifier for ${quote(task.title)}`,
   })
@@ -2612,6 +2623,7 @@ function planCard(c: RunCtx, $: Engine): JSX.Element {
       <Box flexDirection="column">
         <Text size="footnote" dimColor>
           {workersLine(r)}.{r.simplify ? ' A simplifier reads each approved change.' : ''}
+          {r.auto_merge ? ' Approved tasks merge on their own.' : ''}
         </Text>
         {whereNote(r) ? (
           <Text size="footnote" dimColor>
@@ -2972,10 +2984,7 @@ function stuckCard(c: RunCtx, $: Engine, task: TaskView): JSX.Element {
               verb: 'accept',
               args: ['--task', task.id],
               tell: true,
-              done: after =>
-                after?.tasks.find(t => t.id === task.id)?.status === 'approved'
-                  ? `Accepted ${quote(task.title)}. Merge it when you are ready.`
-                  : `Accepted ${quote(task.title)}.`,
+              done: after => `Accepted ${quote(task.title)}. ${landed(after, task)}`.trim(),
               failed: `Could not accept ${quote(task.title)}`,
             })}
           />
@@ -3107,7 +3116,7 @@ function workingCard(c: RunCtx, $: Engine, task: TaskView): JSX.Element {
         <Box flexDirection="row" flexWrap="wrap" gap={1} alignItems="center">
           <Text color="warning">
             {simplifying
-              ? 'Stop the simplifier? The approved change stays, without simplifications, and waits for your Merge.'
+              ? `Stop the simplifier? The approved change stays, without simplifications, and ${c.r.auto_merge ? 'is merged' : 'waits for your Merge'}.`
               : 'Stop this task? Its worker is cancelled.'}
           </Text>
           <Button
@@ -3118,10 +3127,10 @@ function workingCard(c: RunCtx, $: Engine, task: TaskView): JSX.Element {
               verb: 'stop',
               args: ['--task', task.id],
               tell: true,
-              done: (_, text) =>
+              done: (after, text) =>
                 readable(text, c.r)
                   .replace(/^Stopped task \S+\./, `Stopped ${quote(task.title)}.`)
-                  .replace(/^Stopped the simplifier of \S+;.*$/, `Stopped the simplifier. ${quote(task.title)} waits for your Merge as it is.`),
+                  .replace(/^Stopped the simplifier of \S+;.*$/, `Stopped the simplifier. ${quote(task.title)} stays as it is. ${landed(after, task)}`.trim()),
               failed: `Could not stop ${quote(task.title)}`,
             })}
           />
@@ -3273,7 +3282,7 @@ function howRunWorks(els: Els, r: RunView, lead: 'Claude' | 'Codex'): JSX.Elemen
     `A Codex worker builds each task on its own git branch (${r.branch}-<task>) in its own folder; you can watch it in the Codex app.`,
     `${lead} reviews each change when its worker reports, and sends it back with notes until it holds.`,
     ...(r.simplify ? ['A simplifier then proposes simplifications, and you pick the ones the worker applies.'] : []),
-    `You merge each approved task into the run's branch ${r.branch}. A task that depends on others starts once they are merged, from that branch.`,
+    `${r.auto_merge ? 'Tandem merges' : 'You merge'} each approved task into the run's branch ${r.branch}. A task that depends on others starts once they are merged, from that branch.`,
     `When every task is merged, you merge ${r.branch} into your own branch, or open a pull request from it. Tandem never pushes.`,
   ]
   return (
@@ -3352,6 +3361,7 @@ function runControls(c: RunCtx, $: Engine): JSX.Element {
       {!r.needs_approval && (
         <Text size="footnote" dimColor>
           {workersLine(r)}.{r.simplify ? ' Simplifier on.' : ''}
+          {r.auto_merge ? ' Auto merge on.' : ''}
         </Text>
       )}
       {!s.watching && (
@@ -4080,6 +4090,10 @@ export const register: Register = on => {
                 },
               },
               simplify: { type: 'boolean', description: 'A fresh simplifier agent goes over each approved code task.' },
+              auto_merge: {
+                type: 'boolean',
+                description: "Tandem merges each approved task into the run's branch itself (default); false: each waits for the user's Merge.",
+              },
               fix_rounds: { type: 'integer', minimum: 0 },
               budget: { type: 'integer', minimum: 1, description: 'Worker turns the run may start before the user steps in.' },
               setup_command: { type: 'string', description: 'Runs in each new worktree first, such as npm ci.' },
@@ -4136,8 +4150,9 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'orch_review',
       description:
-        "Your verdict on a reported task: approve (it then waits for the user's Merge click, after the simplification pass " +
-        'when the run has one), or changes with concrete notes, which the worker gets as its next turn.',
+        "Your verdict on a reported task: approve (after the run's simplification pass, if it has one, Tandem merges it into " +
+        "the run's branch, or with auto merge off it waits for the user's Merge click), or changes with concrete notes, " +
+        'which the worker gets as its next turn.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -4327,7 +4342,8 @@ export const register: Register = on => {
       if (!['orch_status', 'orch_diff'].includes(name) && (await read($, observing))) return reply(WATCHED_ONLY, true)
       if (name === 'orch_stop' && !e.task) return reply("Name the task to stop: stopping the whole run is the user's, in the Tandem panel.", true)
       const done = await orchCall($, verb, args(e as Record<string, unknown>))
-      return reply(done.text, !done.ok)
+      // What the call set going comes along: a merge on approval starts the tasks that waited for it.
+      return reply([done.text, ...(done.out.events ?? []).map(event => event.text)].join('\n\n'), !done.ok)
     }).catch(toolFailed)
   }
 

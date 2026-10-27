@@ -131,6 +131,8 @@ export type RunView = {
   // where: in the Codex app, which opens each worker's thread, or in the background
   workers: { model: string | null; effort: string; max_parallel: number; access: string; where: 'app' | 'background' }
   simplify: boolean
+  // Tandem merges each approved task into the run's branch itself; off, each waits for the person's Merge.
+  auto_merge: boolean
   setup_command: string | null
   copy: string[]
   codex_quota: number | null
