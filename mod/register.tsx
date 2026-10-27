@@ -2,10 +2,8 @@ import { atom, read, update } from 'claude-code'
 import type { ElementTable, EngineInterface, Register } from 'claude-code'
 
 import type {
-  ChatEntry,
   Flash,
   LoadState,
-  ReviewFinding,
   ReviewView,
   RoomView,
   RunRow,
@@ -35,7 +33,6 @@ type OrchOutput = { ok?: boolean; text?: string; run?: RunView; events?: OrchEve
 type Role = { vendor: 'codex' | 'claude'; access: string; summary: string }
 // What a panel action came to: the panel shows it, and a failure is a toast as well.
 type Outcome = { ok: boolean; text: string }
-type Page = 'run' | 'chat' | 'archived'
 // Who has a task now; the run view colors each task by it.
 type Holder = 'you' | 'plan' | 'codex' | 'claude' | 'done' | 'waiting' | 'failed' | 'cancelled'
 type TaskState = { task: TaskView; holder: Holder; text: string }
@@ -48,35 +45,26 @@ const POLL_MS = 2000
 const CORE = '/codex-skills/tandem/scripts/tandem'
 // Tandem's own notifier app on macOS, built from mac/notifier.swift.
 const NOTIFIER = '/mac/Tandem.app/Contents/MacOS/tandem-notify'
-const KEEP_ENTRIES = 200
 // A message about a finished action fades after this; an error stays until dismissed or replaced.
 const FLASH_MS = 30_000
 // Lists older than this load again when the panel opens.
 const STALE_MS = 60_000
-// How much of one message the conversation view shows; the whole text is in Claude's conversation.
-const ENTRY_CHARS = 1200
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const IDLE: LoadState = { state: 'idle', error: null, at: 0 }
 
 const room = atom({ plugin: 'tandem', key: 'room' } as const, null)
-const entries = atom({ plugin: 'tandem', key: 'entries' } as const, [])
 const threads = atom({ plugin: 'tandem', key: 'threads' } as const, [])
-const paused = atom({ plugin: 'tandem', key: 'paused' } as const, false)
-const held = atom({ plugin: 'tandem', key: 'held' } as const, [])
 const cwd = atom({ plugin: 'tandem', key: 'cwd' } as const, '')
 const run = atom({ plugin: 'tandem', key: 'run' } as const, null)
 const picks = atom({ plugin: 'tandem', key: 'picks' } as const, {})
-const view = atom({ plugin: 'tandem', key: 'view' } as const, 'auto')
 const runs = atom({ plugin: 'tandem', key: 'runs' } as const, [])
 const observing = atom({ plugin: 'tandem', key: 'observing' } as const, false)
 const busy = atom({ plugin: 'tandem', key: 'busy' } as const, [])
 const flash = atom({ plugin: 'tandem', key: 'flash' } as const, null)
-const loads = atom({ plugin: 'tandem', key: 'loads' } as const, { threads: IDLE, runs: IDLE, archived: IDLE })
-const archived = atom({ plugin: 'tandem', key: 'archived' } as const, [])
+const loads = atom({ plugin: 'tandem', key: 'loads' } as const, { threads: IDLE, runs: IDLE })
 const starting = atom({ plugin: 'tandem', key: 'starting' } as const, null)
 const confirming = atom({ plugin: 'tandem', key: 'confirm' } as const, null)
 const runTrouble = atom({ plugin: 'tandem', key: 'runTrouble' } as const, null)
-const chatTrouble = atom({ plugin: 'tandem', key: 'chatTrouble' } as const, null)
 const expanded = atom({ plugin: 'tandem', key: 'expanded' } as const, [])
 const watcher = atom({ plugin: 'tandem', key: 'watcher' } as const, null)
 const notifyOn = atom({ plugin: 'tandem', key: 'notify' } as const, true)
@@ -101,7 +89,13 @@ const WATCHED_ONLY =
   'The Tandem panel shows a run that another session or a Codex thread conducts, so these tools do not act on it. ' +
   'If you orchestrate a run of your own, ask the user to open it in the Tandem panel.'
 
-const USAGE = '[threads | connect <number|id|name> | new [--worktree] <message> | review [PR|branch|commit] | orchestrate <goal> | close]'
+// Where a command the person typed comes from: the terminal, the Remote Control bridge, or an app on the SDK (the desktop
+// app). A command another agent, a plugin or a schedule ran comes from elsewhere.
+const PERSON: string[] = ['composer', 'bridge', 'sdk']
+
+const USAGE =
+  '[orchestrate <goal> | threads | connect <number|id|name> | new [--worktree] <message> | review [PR|branch|commit] | ' +
+  'post <finding numbers> | more | close]'
 
 const SEND_HELP =
   'Send a message to the connected Codex thread. It runs there as Codex\'s next turn (the user sees it live in the Codex app), ' +
@@ -217,15 +211,7 @@ function coreError(stderr: string, fallback: string): string {
   return lines[lines.length - 1] ?? fallback
 }
 
-async function addEntry($: Engine, entry: Omit<ChatEntry, 'id' | 'at' | 'room'>): Promise<void> {
-  const at = await $.clock.now()
-  const current = await read($, room)
-  await update($, entries, list =>
-    [...(list ?? []), { ...entry, room: current?.name, id: `${at}-${(list ?? []).length}`, at }].slice(-KEEP_ENTRIES),
-  )
-}
-
-async function setLoad($: Engine, list: 'threads' | 'runs' | 'archived', state: LoadState['state'], error: string | null = null) {
+async function setLoad($: Engine, list: 'threads' | 'runs', state: LoadState['state'], error: string | null = null) {
   const at = await $.clock.now()
   await update($, loads, all => ({ ...all, [list]: { state, error, at } }))
 }
@@ -275,25 +261,9 @@ async function loadRuns($: Engine): Promise<RunRow[]> {
   }
 }
 
-// The project's archived Codex threads, for the Archived tab.
-async function loadArchived($: Engine): Promise<void> {
-  await setLoad($, 'archived', 'loading')
-  try {
-    const dir = await read($, cwd)
-    const ran = await runCore($, ['threads', '--archived', '--json', '--last', '40', '--cd', dir || '.'], 30_000)
-    if (ran.exitCode !== 0) throw new Error(coreError(ran.stderr, 'the core could not list them'))
-    const rows = threadRows(ran.stdout)
-    await update($, archived, () => rows)
-    await setLoad($, 'archived', 'ready')
-  } catch (error) {
-    await setLoad($, 'archived', 'error', errorText(error))
-  }
-}
-
-// Opens the panel, named for the project, and loads the project's threads and runs again when they are missing or old.
+// Opens the panel, named for the project, and loads the project's runs again when they are missing or old.
 // Opened for a decision, it asks for the keyboard, so the decision's keys work at once.
-async function openPane($: Engine, page?: Page, focus = false): Promise<void> {
-  if (page) await update($, view, () => page)
+async function openPane($: Engine, focus = false): Promise<void> {
   await syncCwd($)
   const dir = await read($, cwd)
   const project = dir.split('/').filter(Boolean).pop()
@@ -305,20 +275,13 @@ async function refreshLists($: Engine, force = false): Promise<void> {
   const now = await $.clock.now()
   const state = await read($, loads)
   const due = (load: LoadState) => force || load.state === 'idle' || load.state === 'error' || now - load.at > STALE_MS
-  await Promise.all([due(state.threads) ? loadThreads($) : undefined, due(state.runs) ? loadRuns($) : undefined])
-}
-
-async function goTo($: Engine, page: Page): Promise<void> {
-  await update($, confirming, () => null)
-  await update($, view, () => page)
-  if (page === 'archived') await loadArchived($)
-  else await refreshLists($)
+  if (due(state.runs)) await loadRuns($)
 }
 
 // Keys of panel actions in flight: a second press of the same button does nothing until the first is done.
 const inFlight = new Set<string>()
 
-async function act($: Engine, key: string, scope: Page, work: () => Promise<Outcome | null>): Promise<void> {
+async function act($: Engine, key: string, work: () => Promise<Outcome | null>): Promise<void> {
   if (inFlight.has(key)) return
   inFlight.add(key)
   await update($, busy, keys => [...keys.filter(k => k !== key), key])
@@ -331,30 +294,29 @@ async function act($: Engine, key: string, scope: Page, work: () => Promise<Outc
     inFlight.delete(key)
     await update($, busy, keys => keys.filter(k => k !== key))
   }
-  if (outcome) await showOutcome($, scope, outcome)
+  if (outcome) await showOutcome($, outcome)
 }
 
-async function showOutcome($: Engine, scope: Page, outcome: Outcome): Promise<void> {
-  const shown: Flash = { scope, tone: outcome.ok ? 'done' : 'error', text: outcome.text, at: await $.clock.now() }
+async function showOutcome($: Engine, outcome: Outcome): Promise<void> {
+  const shown: Flash = { tone: outcome.ok ? 'done' : 'error', text: outcome.text, at: await $.clock.now() }
   await update($, flash, () => shown)
   if (!outcome.ok) $.ui.toast(`Tandem: ${clipText(outcome.text, 120)}`)
 }
 
 // The Codex app opens a thread from its own link, codex://threads/<id>, on the Mac this session runs on.
-async function openInCodex($: Engine, thread: string, scope: Page): Promise<void> {
-  await act($, `codex-${thread}`, scope, async () => {
+async function openInCodex($: Engine, thread: string): Promise<void> {
+  await act($, `codex-${thread}`, async () => {
     const ran = await $.process.run(['/usr/bin/open', `codex://threads/${encodeURIComponent(thread)}`], { timeoutMs: 15_000 })
     if (ran.exitCode === 0) return null
     return { ok: false, text: `Could not open the Codex app: ${coreError(ran.stderr, 'macOS could not open its link')}` }
   })
 }
 
-async function noteTrouble($: Engine, where: 'run' | 'chat', text: string | null): Promise<void> {
-  const before = where === 'run' ? await read($, runTrouble) : await read($, chatTrouble)
+// A run poll that keeps failing: the panel says so from the second failure on.
+async function noteTrouble($: Engine, text: string | null): Promise<void> {
+  const before = await read($, runTrouble)
   if (text === null && !before) return
-  const next = text === null ? null : { text, count: (before?.count ?? 0) + 1 }
-  if (where === 'run') await update($, runTrouble, () => next)
-  else await update($, chatTrouble, () => next)
+  await update($, runTrouble, () => (text === null ? null : { text, count: (before?.count ?? 0) + 1 }))
 }
 
 // A run of this project: the session that started it conducts it; any other session only watches it.
@@ -371,11 +333,10 @@ async function openRun($: Engine, row: RunRow): Promise<void> {
   const dir = (await read($, cwd)) || '.'
   const ran = await runCore($, ['orch', 'status', '--run', row.id, '--cd', dir, '--json'])
   if (ran.exitCode !== 0) {
-    await showOutcome($, 'run', { ok: false, text: `Could not open that run: ${coreError(ran.stderr, 'the core refused')}` })
+    await showOutcome($, { ok: false, text: `Could not open that run: ${coreError(ran.stderr, 'the core refused')}` })
     return
   }
   await update($, run, () => (JSON.parse(ran.stdout) as { run: RunView }).run)
-  await update($, view, () => 'run')
 }
 
 // The run this session orchestrates, as the orchestrator needs it once its conversation was compacted, resumed or
@@ -397,15 +358,6 @@ async function runJournal($: Engine, how: string): Promise<string | null> {
     `[Tandem] You orchestrate this run, and your conversation was ${what}, so here is where the run stands. Read it ` +
     `before you act; the Tandem panel shows the same.\n\n${ran.stdout.trim()}\n\n${await orchestratorGuide($)}`
   )
-}
-
-function ago(seconds: number | null, now: number): string {
-  if (seconds === null) return ''
-  const minutes = Math.max(0, Math.round((now / 1000 - seconds) / 60))
-  if (minutes < 1) return 'just now'
-  if (minutes < 60) return `${minutes} min ago`
-  if (minutes < 60 * 24) return `${Math.round(minutes / 60)} h ago`
-  return `${Math.round(minutes / 60 / 24)} d ago`
 }
 
 function clipText(value: string, size: number): string {
@@ -456,7 +408,7 @@ function listThreads(rows: ThreadRow[]): string {
 }
 
 const DISCONNECTED_MEANWHILE =
-  'The user pressed Disconnect while this was connecting, so the panel is not connected. Do not connect again on your own: ' +
+  'The user disconnected (/tandem close) while this was connecting, so nothing is connected. Do not connect again on your own: ' +
   'ask the user first.'
 
 // Makes `next` the open conversation. A stale answer is not attached: the room the core just opened is closed again and the
@@ -471,16 +423,12 @@ async function attach($: Engine, epoch: number, next: RoomView): Promise<boolean
     return false
   }
   await update($, room, () => next)
-  await update($, chatTrouble, () => null)
   // The message of the last action was about the conversation that is gone ("Disconnected from …").
   await update($, flash, () => null)
-  await update($, view, () => 'chat')
-  await setExpanded($, ['all-chats'], false)
   return true
 }
 
-// `by` says who asked, so the conversation can say who connected it: a press in the list, Claude's tool, or /tandem connect.
-async function connect($: Engine, target: string, by: 'list' | 'Claude' | 'command' = 'list'): Promise<Outcome> {
+async function connect($: Engine, target: string): Promise<Outcome> {
   const epoch = ++roomEpoch
   const wanted = target.trim()
   if (!wanted) return { ok: false, text: 'Name a thread: its number from the threads list, its id, or part of its name.' }
@@ -516,7 +464,6 @@ async function connect($: Engine, target: string, by: 'list' | 'Claude' | 'comma
     closed: false,
   })
   if (!attached) return { ok: false, text: DISCONNECTED_MEANWHILE }
-  await addEntry($, { from: 'notice', numbers: [], text: `${by === 'Claude' ? 'Claude connected to' : 'Connected to'} ${threadName ?? id}.` })
   return {
     ok: true,
     text:
@@ -563,8 +510,6 @@ async function startCodex($: Engine, message: string, worktree: boolean): Promis
         `but ${DISCONNECTED_MEANWHILE} Its answer will not arrive here; the thread stays in the Codex app.`,
     }
   }
-  await addEntry($, { from: 'notice', numbers: [], text: `Started a new Codex thread${worktree ? ' in its own git worktree' : ''}.` })
-  if (started.sent) await addEntry($, { from: 'claude', numbers: [started.sent], text })
   return {
     ok: true,
     text:
@@ -606,7 +551,6 @@ async function startReview($: Engine, target: string, focus = ''): Promise<Outco
     review: started.review,
   })
   if (!attached) return { ok: false, text: `Codex started reviewing ${label}, but ${DISCONNECTED_MEANWHILE}` }
-  await addEntry($, { from: 'notice', numbers: [], text: `Codex is reviewing ${label}, read-only.` })
   return {
     ok: true,
     text:
@@ -615,37 +559,20 @@ async function startReview($: Engine, target: string, focus = ''): Promise<Outco
   }
 }
 
-async function reviewFromPanel($: Engine, target: string): Promise<void> {
-  await act($, 'review', 'chat', async () => {
-    const at = await $.clock.now()
-    await update($, starting, () => ({ kind: 'review' as const, text: target || 'your uncommitted changes', at }))
-    let started: Outcome
-    try {
-      started = await startReview($, target)
-    } finally {
-      await update($, starting, () => null)
-    }
-    return started.ok ? null : { ok: false, text: `Could not start the review: ${coreError(started.text, 'the core refused')}` }
-  })
-}
-
-// Posts the findings the person picked to the pull request: one review, with a comment on each finding's lines.
-async function postReview($: Engine, current: RoomView, ids: number[]): Promise<void> {
-  await act($, `post-${current.name}`, 'chat', async () => {
-    await update($, confirming, () => null)
-    const ran = await runCore(
-      $,
-      ['review-post', '--room', current.name, '--cd', current.root, '--items', ids.join(','), '--json'],
-      120_000,
-    )
-    if (ran.exitCode !== 0) return { ok: false, text: `Could not post the review: ${coreError(ran.stderr, 'GitHub refused it')}` }
-    const out = JSON.parse(ran.stdout) as { posted: number; inline: boolean }
-    await update($, picks, all => ({ ...all, [`review:${current.name}`]: [] }))
-    return {
-      ok: true,
-      text: `Posted ${plural(out.posted, 'finding')} to the pull request${out.inline ? ', each on its lines' : " in the review's text: GitHub could not place them on their lines"}.`,
-    }
-  })
+// Posts the findings the person picked, by their numbers in the review, to the pull request: one review, with a comment
+// on each finding's lines. Only the person runs it, with /tandem post.
+async function postReview($: Engine, items: string): Promise<Outcome> {
+  const current = await read($, room)
+  if (!current?.review) return { ok: false, text: 'No review is open: start one with /tandem review.' }
+  const ids = items.split(',').map(item => item.trim()).filter(item => /^\d+$/.test(item))
+  if (ids.length === 0) return { ok: false, text: 'Name the findings to post by their numbers in the review: /tandem post 1,3' }
+  const ran = await runCore($, ['review-post', '--room', current.name, '--cd', current.root, '--items', ids.join(','), '--json'], 120_000)
+  if (ran.exitCode !== 0) return { ok: false, text: `Could not post the review: ${coreError(ran.stderr, 'GitHub refused it')}` }
+  const out = JSON.parse(ran.stdout) as { posted: number; inline: boolean }
+  return {
+    ok: true,
+    text: `Posted ${plural(out.posted, 'finding')} to the pull request${out.inline ? ', each on its lines' : " in the review's text: GitHub could not place them on their lines"}.`,
+  }
 }
 
 async function sendMessage($: Engine, from: 'claude' | 'user', text: string): Promise<Outcome> {
@@ -654,7 +581,7 @@ async function sendMessage($: Engine, from: 'claude' | 'user', text: string): Pr
     return {
       ok: false,
       text:
-        'No Codex thread is connected: the user may have disconnected it in the panel. Do not connect again on your own; ' +
+        'No Codex thread is connected: the user may have disconnected it with /tandem close. Do not connect again on your own; ' +
         'ask the user, or go on without Codex.',
     }
   }
@@ -664,8 +591,6 @@ async function sendMessage($: Engine, from: 'claude' | 'user', text: string): Pr
     150_000,
   )
   if (ran.exitCode !== 0) return { ok: false, text: ran.stderr.trim() || 'Sending failed.' }
-  const n = Number(/#(\d+)/.exec(ran.stdout)?.[1] ?? 0)
-  await addEntry($, { from, numbers: n ? [n] : [], text })
   await update($, room, value =>
     value && (value.name === current.name ? { ...value, used: from === 'user' ? 0 : value.used + 1 } : value),
   )
@@ -769,11 +694,7 @@ async function orchestratePrompt($: Engine, goal: string): Promise<string> {
 }
 
 async function deliver($: Engine, prompt: string): Promise<void> {
-  if (await read($, paused)) {
-    await update($, held, list => [...(list ?? []), prompt])
-  } else {
-    inBackground(submitPrompt($, prompt))
-  }
+  inBackground(submitPrompt($, prompt))
 }
 
 // Hands Claude a prompt. While Tandem's watcher holds, the session takes it only at the watcher's next tool round, so
@@ -910,7 +831,7 @@ async function pollRun($: Engine): Promise<void> {
     const polled = watching
       ? await orchCall($, 'status', ['--json'], undefined, 30_000)
       : await orchCall($, 'poll', [], undefined, 60_000)
-    await noteTrouble($, 'run', polled.ok ? null : polled.text)
+    await noteTrouble($, polled.ok ? null : polled.text)
     if (watching) return
     for (const event of polled.out.events ?? []) {
       $.ui.toast(eventToast(event, current))
@@ -919,7 +840,7 @@ async function pollRun($: Engine): Promise<void> {
     await refreshBusy($)
   } catch (error) {
     // The run's saved state lets the next poll pick up where this one left off; the panel says it keeps failing.
-    await noteTrouble($, 'run', errorText(error))
+    await noteTrouble($, errorText(error))
   } finally {
     pollingRun = false
   }
@@ -1081,7 +1002,7 @@ type Decision = {
 }
 
 async function decide($: Engine, decision: Decision): Promise<void> {
-  await act($, decision.key, 'run', async () => {
+  await act($, decision.key, async () => {
     await update($, confirming, () => null)
     const result = await orchCall($, decision.verb, decision.args ?? [])
     const after = await read($, run)
@@ -1108,7 +1029,7 @@ function landed(after: RunView | null, task: TaskView): string {
 }
 
 async function mergeAll($: Engine): Promise<void> {
-  await act($, 'merge-all', 'run', async () => {
+  await act($, 'merge-all', async () => {
     const current = await read($, run)
     const ready = (current?.tasks ?? []).filter(task => task.status === 'approved')
     const merged: TaskView[] = []
@@ -1188,7 +1109,8 @@ function promptFor(current: RoomView, event: PollEvent): string {
     current.review && event.type === 'answer'
       ? 'This is Codex\'s review. Before you tell the user, check each finding in the code yourself (the cited lines, their ' +
         'callers and tests): say which findings hold and which do not, and why. Ask the user before you fix anything; ' +
-        'posting findings to GitHub is theirs, from the Tandem panel. '
+        'posting findings to GitHub is theirs: give each finding its number, and the user posts the ones they pick with ' +
+        '/tandem post <numbers>, for a pull request. '
       : ''
   return (
     `[Tandem · ${current.threadName ?? current.thread}] ${head}:\n\n${event.text}\n\n---\n` +
@@ -1207,13 +1129,11 @@ async function poll($: Engine): Promise<void> {
   try {
     const ran = await runCore($, ['poll', '--room', current.name, '--cd', current.root], 30_000)
     if (ran.exitCode !== 0) {
-      await noteTrouble($, 'chat', coreError(ran.stderr, 'the poll failed'))
       return
     }
     const out = JSON.parse(ran.stdout) as PollOutput
     // The panel left this room while the core read it (a Disconnect, or another thread): its news is not the new room's.
     if ((await read($, room))?.name !== current.name) return
-    await noteTrouble($, 'chat', null)
     if (out.busy) return
     const fresh = {
       turnRunning: out.turn_running,
@@ -1230,25 +1150,15 @@ async function poll($: Engine): Promise<void> {
     await refreshBusy($)
     for (const event of out.events) {
       const fromCodex = event.type === 'answer' || event.type === 'message'
-      await addEntry($, { from: fromCodex ? 'codex' : 'notice', numbers: event.numbers, text: event.text })
       $.ui.toast(fromCodex ? `Codex: ${clipText(event.text, 80)}` : clipText(event.text, 120))
       if (event.type === 'waiting') continue
       await deliver($, promptFor(current, event))
     }
   } catch (error) {
     // The room's saved state lets the next poll pick up where this one left off; the panel says it keeps failing.
-    await noteTrouble($, 'chat', errorText(error))
   } finally {
     polling = false
   }
-}
-
-async function setPaused($: Engine, value: boolean): Promise<void> {
-  await update($, paused, () => value)
-  if (value) return
-  const waiting = await read($, held)
-  await update($, held, () => [])
-  for (const prompt of waiting) inBackground(submitPrompt($, prompt))
 }
 
 // Disconnect always works here: the panel lets go of the conversation even when the core cannot mark its room closed, and says so.
@@ -1261,8 +1171,6 @@ async function closeRoom($: Engine): Promise<Outcome> {
     stderr: errorText(error),
   }))
   await update($, room, () => null)
-  await update($, chatTrouble, () => null)
-  await update($, view, () => 'chat')
   const name = current.threadName ?? 'the Codex thread'
   if (ran.exitCode !== 0) {
     return {
@@ -1280,9 +1188,9 @@ async function closeRoom($: Engine): Promise<Outcome> {
   }
 }
 
-async function allowMore($: Engine): Promise<Outcome | null> {
+async function allowMore($: Engine): Promise<Outcome> {
   const current = await read($, room)
-  if (!current) return null
+  if (!current || current.closed) return { ok: false, text: 'No conversation with Codex is open.' }
   const limit = current.limit + 10
   const ran = await runCore($, ['open', '--room', current.name, '--cd', current.root, '--limit', String(limit), '--json'])
   if (ran.exitCode !== 0) return { ok: false, text: `Could not allow more messages: ${coreError(ran.stderr, 'the core refused')}` }
@@ -1291,7 +1199,7 @@ async function allowMore($: Engine): Promise<Outcome | null> {
 }
 
 async function orchestrate($: Engine, goal: string): Promise<void> {
-  await act($, 'goal', 'run', async () => {
+  await act($, 'goal', async () => {
     const at = await $.clock.now()
     await update($, starting, () => ({ kind: 'goal' as const, text: goal, at }))
     try {
@@ -1304,79 +1212,12 @@ async function orchestrate($: Engine, goal: string): Promise<void> {
   })
 }
 
-async function startThread($: Engine, message: string): Promise<void> {
-  await act($, 'start', 'chat', async () => {
-    const at = await $.clock.now()
-    await update($, starting, () => ({ kind: 'thread' as const, text: message, at }))
-    let started: Outcome
-    try {
-      started = await startCodex($, message, false)
-    } finally {
-      await update($, starting, () => null)
-    }
-    return started.ok ? null : { ok: false, text: `Could not start a Codex thread: ${coreError(started.text, 'the core refused')}` }
-  })
-}
-
-async function connectFromPanel($: Engine, thread: string): Promise<void> {
-  await act($, `thread-${thread}`, 'chat', async () => {
-    const done = await connect($, thread)
-    return done.ok ? null : { ok: false, text: `Could not connect: ${done.text}` }
-  })
-}
-
-// Archives a Codex thread: Codex keeps it with the archived threads, where the Archived tab can restore it.
-async function archiveThread($: Engine, thread: string, label: string): Promise<void> {
-  await act($, `archive-${thread}`, 'chat', async () => {
-    const ran = await runCore($, ['archive', '--thread', thread, '--cd', (await read($, cwd)) || '.'])
-    if (ran.exitCode !== 0) return { ok: false, text: `Could not archive ${label}: ${coreError(ran.stderr, 'Codex refused')}` }
-    await update($, threads, rows => rows.filter(row => row.id !== thread))
-    await setLoad($, 'archived', 'idle')
-    if ((await read($, room))?.thread === thread) {
-      roomEpoch += 1
-      await update($, room, () => null)
-      await update($, chatTrouble, () => null)
-    }
-    await update($, view, () => 'chat')
-    return { ok: true, text: `Archived ${label}. The Archived tab can restore it.` }
-  })
-}
-
-async function restoreThread($: Engine, thread: string, label: string): Promise<void> {
-  await act($, `restore-${thread}`, 'archived', async () => {
-    const ran = await runCore($, ['unarchive', '--thread', thread, '--cd', (await read($, cwd)) || '.'])
-    if (ran.exitCode !== 0) return { ok: false, text: `Could not restore ${label}: ${coreError(ran.stderr, 'Codex refused')}` }
-    await update($, archived, rows => rows.filter(row => row.id !== thread))
-    await setLoad($, 'threads', 'idle')
-    return { ok: true, text: `Restored ${label}. It is back in the Codex chat tab and the Codex app.` }
-  })
-}
-
-let typed = 0
-
-async function sayToCodex($: Engine, text: string): Promise<void> {
-  // Every message has its own key: a second one typed while the first is on its way is sent too.
-  typed += 1
-  await act($, `say-${typed}`, 'chat', async () => {
-    const sent = await sendMessage($, 'user', text)
-    return sent.ok ? null : { ok: false, text: `Could not send your message: ${coreError(sent.text, 'the core refused it')}` }
-  })
-}
-
 async function closeRun($: Engine): Promise<void> {
   await update($, run, () => null)
   await update($, observing, () => false)
   await update($, runTrouble, () => null)
   await update($, confirming, () => null)
-  await update($, view, () => 'run')
   await refreshLists($, true)
-}
-
-async function forgetRoom($: Engine): Promise<void> {
-  roomEpoch += 1
-  await update($, room, () => null)
-  await update($, chatTrouble, () => null)
-  await update($, view, () => 'chat')
 }
 
 // --- what the panel says ----------------------------------------------------------------------------
@@ -1540,37 +1381,6 @@ function chatStatus(current: RoomView): { glyph: string; color: string; text: st
     return { glyph: '○', color: 'inactive', text: `Waiting for Codex to pick up ${current.pending.map(n => `#${n}`).join(', ')}` }
   }
   return { glyph: '●', color: 'success', text: 'Ready for the next message' }
-}
-
-function speaker(entry: ChatEntry): { label: string; color?: string; refs: string } {
-  const numbers = entry.numbers.map(n => `#${n}`).join(', ')
-  if (entry.from === 'claude') return { label: 'Claude', color: 'claude', refs: numbers }
-  if (entry.from === 'codex') return { label: 'Codex', color: 'ide', refs: numbers ? `answer to ${numbers}` : '' }
-  if (entry.from === 'user') return { label: 'You', refs: numbers }
-  return { label: 'Tandem', color: 'inactive', refs: '' }
-}
-
-// The conversation view shows the newest messages that fit; the pane scrolls for the rest of a long one.
-function fitEntries(list: ChatEntry[], columns: number, room: number): { shown: ChatEntry[]; hidden: number } {
-  const width = Math.max(20, columns)
-  let used = 0
-  let start = list.length
-  while (start > 0) {
-    const entry = list[start - 1]
-    if (!entry) break
-    const lines = entryText(entry.text).split('\n')
-    const cost = 4 + lines.reduce((sum, line) => sum + Math.max(1, Math.ceil(line.length / width)), 0)
-    if (start < list.length && used + cost > room) break
-    used += cost
-    start -= 1
-  }
-  return { shown: list.slice(start), hidden: start }
-}
-
-function entryText(text: string): string {
-  if (text.length <= ENTRY_CHARS) return text
-  const cut = text.lastIndexOf('\n', ENTRY_CHARS)
-  return `${text.slice(0, cut > ENTRY_CHARS / 2 ? cut : ENTRY_CHARS).trimEnd()}\n\n…`
 }
 
 function inputOf(els: Els) {
@@ -1848,59 +1658,6 @@ function taskDetails(els: Els, task: TaskView, r: RunView, whole?: { open: boole
   )
 }
 
-// The tab a view of `auto` opens: the run while there is one, else the conversation, else the start of a run.
-function tabFor(s: Snapshot): Page {
-  if (s.view === 'run' || s.view === 'chat' || s.view === 'archived') return s.view
-  return !s.run && s.room ? 'chat' : 'run'
-}
-
-// What a tab's label says about it: decisions waiting, or work going on.
-function runTabMark(r: RunView): { text: string; color: string } | null {
-  if (r.status === 'done') return { text: '✓', color: 'success' }
-  if (r.status === 'stopped') return null
-  const waiting = decisions(r)
-  if (waiting > 0) return { text: `◆ ${waiting}`, color: 'warning' }
-  return r.tasks.some(task => WORKING.includes(task.status)) ? { text: '●', color: 'ide' } : null
-}
-
-function chatTabMark(current: RoomView, waiting: number, isPaused: boolean): { text: string; color: string } | null {
-  if (current.closed) return null
-  if (current.used >= current.limit || (isPaused && waiting > 0)) return { text: '◆', color: 'warning' }
-  return current.turnRunning ? { text: '●', color: 'ide' } : null
-}
-
-function tabBar(els: Els, $: Engine, s: Snapshot, tab: Page): JSX.Element {
-  const { Box, Text, Button } = els
-  const tabs: [Page, string, { text: string; color: string } | null][] = [
-    ['run', 'Orchestrate', s.run ? runTabMark(s.run) : null],
-    ['chat', 'Codex chat', s.room ? chatTabMark(s.room, s.held, s.paused) : null],
-    ['archived', 'Archived', null],
-  ]
-  // The open tab is a filled pill; the others are its label alone, dim until the pointer is on them.
-  return (
-    <Box flexDirection="column">
-      <Box flexDirection="row" flexWrap="wrap" gap={1} alignItems="center">
-        {tabs.map(([page, label, mark]) =>
-          tab === page ? (
-            <Button key={`tab-${page}`} variant="primary" onPress={() => inBackground(goTo($, page))}>
-              {label}
-              {mark ? <Text color={mark.color}> {mark.text}</Text> : null}
-            </Button>
-          ) : (
-            <Button key={`tab-${page}`} plain dimColor onPress={() => inBackground(goTo($, page))}>
-              {label}
-              {mark ? <Text color={mark.color}> {mark.text}</Text> : null}
-            </Button>
-          ),
-        )}
-      </Box>
-      <Text dimColor wrap="truncate-end">
-        {'─'.repeat(Math.max(10, s.columns - 2))}
-      </Text>
-    </Box>
-  )
-}
-
 // The Orchestrate tab with no run open: how a run goes, the goal to start one, and the project's other runs to watch.
 function orchestrateStart(els: Els, $: Engine, s: Snapshot): JSX.Element {
   const { Box, Text, Button } = els
@@ -1976,240 +1733,19 @@ function orchestrateStart(els: Els, $: Engine, s: Snapshot): JSX.Element {
   )
 }
 
-// One thread of the project: a press connects to it; Archive moves it to Codex's archived threads.
-function threadRow(els: Els, $: Engine, s: Snapshot, row: ThreadRow): JSX.Element {
-  const { Box, Text, Button } = els
-  const label = clipText(threadLabel(row), 80)
-  const when = s.busy.includes(`thread-${row.id}`) ? 'connecting…' : ago(row.updatedTs, s.now)
-  return (
-    <Box key={`row-${row.id}`} flexDirection="row" justifyContent="space-between" alignItems="flex-start" gap={1}>
-      <Box flexDirection="column" flexShrink={1}>
-        <Button key={`thread-${row.id}`} plain onPress={() => inBackground(connectFromPanel($, row.id))}>
-          <Text color={row.openIn ? 'success' : 'inactive'}>{row.openIn ? '●' : '○'}</Text>{' '}
-          {row.name ? <Text weight="medium">{label}</Text> : <Text italic>{label}</Text>}
-        </Button>
-        <Box paddingLeft={2}>
-          <Text size="footnote" dimColor>
-            {when}
-            {row.openIn ? ' · open in the Codex app' : ''}
-          </Text>
-        </Box>
-      </Box>
-      <Button
-        key={`archive-${row.id}`}
-        plain
-        dimColor
-        label={s.busy.includes(`archive-${row.id}`) ? 'Archiving…' : 'Archive'}
-        onPress={() => inBackground(archiveThread($, row.id, quote(row.name ?? row.preview ?? 'this thread')))}
-      />
-    </Box>
-  )
-}
-
-// The Codex chat tab with no conversation open: start a thread, or continue one of the project's.
-function chatStart(els: Els, $: Engine, s: Snapshot): JSX.Element {
-  const { Box, Text, Button } = els
-  const Input = inputOf(els)
-  const rows = talkable(s.threads)
-  const showAll = s.expanded.includes('threads')
-  const listed = rows.slice(0, showAll ? 30 : 6)
-  const threadLoad = s.loads.threads
-  const refreshing = threadLoad.state === 'loading'
-  const reload = () => inBackground(refreshLists($, true))
-
-  let threadList: JSX.Element
-  if (rows.length > 0) {
-    threadList = (
-      <Box flexDirection="column">
-        <Box flexDirection="row" justifyContent="space-between" alignItems="center">
-          <Text weight="semibold">Or continue a thread</Text>
-          <Button key="threads-refresh" plain dimColor label={refreshing ? 'Refreshing…' : 'Refresh'} onPress={reload} />
-        </Box>
-        <Box flexDirection="column" gap={1}>
-          {listed.map(row => threadRow(els, $, s, row))}
-        </Box>
-        {rows.length > 6 ? (
-          <Button
-            key="threads-more"
-            plain
-            dimColor
-            label={showAll ? 'Show fewer' : `Show ${plural(rows.length - listed.length, 'more thread')}`}
-            onPress={toggleOn($, s, 'threads')}
-          />
-        ) : null}
-        {threadLoad.state === 'error' && (
-          <Text size="footnote" color="error">
-            Could not refresh the list: {threadLoad.error}
-          </Text>
-        )}
-      </Box>
-    )
-  } else if (threadLoad.state === 'error') {
-    threadList = (
-      <Box flexDirection="column">
-        <Text color="error">Could not list this project's Codex threads: {threadLoad.error}</Text>
-        <Button key="threads-retry" plain label="Try again" onPress={reload} />
-      </Box>
-    )
-  } else if (threadLoad.state === 'ready') {
-    threadList = (
-      <Box flexDirection="row" justifyContent="space-between" alignItems="flex-start" gap={1}>
-        <Box flexShrink={1}>
-          <Text dimColor>No Codex threads in this project yet. {Input ? 'Start one above.' : 'Ask Claude to start one.'}</Text>
-        </Box>
-        <Button key="threads-refresh" plain dimColor label="Refresh" onPress={reload} />
-      </Box>
-    )
-  } else if (refreshing) {
-    threadList = <Text dimColor>Looking for this project's Codex threads…</Text>
-  } else {
-    threadList = <Button key="threads-load" plain label="Show recent threads" onPress={reload} />
-  }
-
-  const connected = s.room && !s.room.closed ? s.room : null
-  return (
-    <Box flexDirection="column" gap={1}>
-      {connected ? (
-        <Box flexDirection="row" justifyContent="space-between" alignItems="center" gap={1}>
-          <Box flexDirection="row" alignItems="center" gap={1} flexShrink={1}>
-            {connected.turnRunning ? workingMark(els, 'codex') : <Text color="success">●</Text>}
-            <Box flexShrink={1}>
-              <Text size="footnote">
-                Connected to <Text weight="semibold">{connected.review?.label ?? connected.threadName ?? 'a Codex thread'}</Text>
-              </Text>
-            </Box>
-          </Box>
-          <Button key="back-to-chat" label="Back to it" onPress={() => inBackground(setExpanded($, ['all-chats'], false))} />
-        </Box>
-      ) : null}
-      {s.starting?.kind === 'thread' || s.starting?.kind === 'review' ? startingCard(els, $, s.starting) : null}
-      <Box flexDirection="column" gap={1} borderStyle="round" borderColor="ide" paddingX={1}>
-        <Box flexDirection="column">
-          <Text size="heading" weight="semibold">
-            Talk with Codex
-          </Text>
-          <Text dimColor>
-            <Text color="claude">Claude</Text> and a <Text color="ide">Codex</Text> thread message each other live; you can
-            watch and write in the thread in the Codex app.
-          </Text>
-        </Box>
-        {Input ? (
-          <Input
-            key="start"
-            rows={2}
-            placeholder="First message to Codex"
-            submitLabel="Start thread"
-            onSubmit={value => {
-              if (value.trim()) inBackground(startThread($, value.trim()))
-            }}
-          />
-        ) : (
-          <Text dimColor>Ask Claude to start a Codex thread, or continue one below.</Text>
-        )}
-      </Box>
-      <Box flexDirection="column" gap={1} borderStyle="round" borderColor="ide" paddingX={1}>
-        <Box flexDirection="column">
-          <Text weight="semibold">Review a change</Text>
-          <Text dimColor>
-            Codex reads it without changing anything: bugs, how it fits the codebase, tests, security. Claude checks each finding
-            before telling you, and nothing goes to GitHub unless you post it.
-          </Text>
-        </Box>
-        {Input ? (
-          <Input
-            key="review-target"
-            placeholder="PR number, branch or commit"
-            submitLabel={s.busy.includes('review') ? 'Starting…' : 'Review'}
-            onSubmit={value => {
-              if (value.trim()) inBackground(reviewFromPanel($, value.trim()))
-            }}
-          />
-        ) : (
-          <Text dimColor>Ask Claude to have Codex review a pull request, a branch or your changes.</Text>
-        )}
-        <Button
-          key="review-changes"
-          plain
-          dimColor
-          label="Or review your uncommitted changes"
-          onPress={() => inBackground(reviewFromPanel($, ''))}
-        />
-      </Box>
-      {threadList}
-    </Box>
-  )
-}
-
-// The Archived tab: the project's archived Codex threads, each one press from coming back.
-function archivedTab(els: Els, $: Engine, s: Snapshot): JSX.Element {
-  const { Box, Text, Button } = els
-  const load = s.loads.archived ?? IDLE
-  const rows = s.archived.filter(row => !row.worker)
-  return (
-    <Box flexDirection="column" gap={1}>
-      <Box flexDirection="row" justifyContent="space-between" alignItems="flex-start" gap={1}>
-        <Box flexDirection="column" flexShrink={1}>
-          <Text weight="semibold">Archived Codex threads</Text>
-          <Text size="footnote" dimColor>
-            Archived threads leave the Codex app's list and this project's threads. Restore brings one back.
-          </Text>
-        </Box>
-        <Button
-          key="archived-refresh"
-          plain
-          dimColor
-          label={load.state === 'loading' ? 'Refreshing…' : 'Refresh'}
-          onPress={() => inBackground(loadArchived($))}
-        />
-      </Box>
-      {load.state === 'error' ? (
-        <Text color="error">Could not list the archived threads: {load.error}</Text>
-      ) : rows.length === 0 ? (
-        <Text dimColor>{load.state === 'loading' || load.state === 'idle' ? 'Looking for archived threads…' : 'No archived threads in this project.'}</Text>
-      ) : (
-        <Box flexDirection="column">
-          {rows.map(row => (
-            <Box key={`archived-${row.id}`} flexDirection="row" justifyContent="space-between" alignItems="flex-start" gap={1}>
-              <Box flexDirection="column" flexShrink={1}>
-                {row.name ? <Text>{clipText(row.name, 80)}</Text> : <Text italic>{clipText(threadLabel(row), 80)}</Text>}
-                <Text size="footnote" dimColor>
-                  Last active {ago(row.updatedTs, s.now)}
-                </Text>
-              </Box>
-              <Button
-                key={`restore-${row.id}`}
-                label={s.busy.includes(`restore-${row.id}`) ? 'Restoring…' : 'Restore'}
-                onPress={() => inBackground(restoreThread($, row.id, quote(row.name ?? row.preview ?? 'the thread')))}
-              />
-            </Box>
-          ))}
-        </Box>
-      )}
-    </Box>
-  )
-}
-
 // --- the panel ---------------------------------------------------------------------------------------
 
 type Snapshot = {
   run: RunView | null
-  room: RoomView | null
-  view: 'auto' | 'home' | 'run' | 'chat' | 'archived'
-  threads: ThreadRow[]
-  archived: ThreadRow[]
   runs: RunRow[]
-  loads: { threads: LoadState; runs: LoadState; archived?: LoadState }
+  loads: { threads: LoadState; runs: LoadState }
   busy: string[]
   flash: Flash | null
   starting: Starting | null
   confirm: string | null
   watching: boolean
   picks: Record<string, number[]>
-  paused: boolean
-  held: number
   runTrouble: Trouble | null
-  chatTrouble: Trouble | null
-  entries: ChatEntry[]
   expanded: string[]
   now: number
   columns: number
@@ -2221,27 +1757,24 @@ type Snapshot = {
 
 async function snapshot($: Engine, columns: number, rows: number, surface: string): Promise<Snapshot> {
   const [
-    current, chat, chosen, threadRows, archivedRows, runRows, loaded, keys, shownFlash, pending, confirm, watching, chosenPicks,
-    isPaused, waiting, troubleRun, troubleChat, list, opened, wanted, now,
+    current, runRows, loaded, keys, shownFlash, pending, confirm, watching, chosenPicks, troubleRun, opened,
+    wanted, now,
   ] = await Promise.all([
-    read($, run), read($, room), read($, view), read($, threads), read($, archived), read($, runs), read($, loads), read($, busy),
-    read($, flash), read($, starting), read($, confirming), read($, observing), read($, picks), read($, paused), read($, held),
-    read($, runTrouble), read($, chatTrouble), read($, entries), read($, expanded), read($, notifyOn), $.clock.now(),
+    read($, run), read($, runs), read($, loads), read($, busy), read($, flash), read($, starting), read($, confirming),
+    read($, observing), read($, picks), read($, runTrouble), read($, expanded), read($, notifyOn),
+    $.clock.now(),
   ])
   return {
-    run: current, room: chat, view: chosen, threads: threadRows, archived: archivedRows, runs: runRows, loads: loaded, busy: keys,
-    flash: shownFlash,
-    starting: pending, confirm, watching, picks: chosenPicks, paused: isPaused, held: waiting.length, runTrouble: troubleRun,
-    chatTrouble: troubleChat, entries: list, expanded: opened, now, columns, rows, canOpenCodex: surface !== 'mobile',
-    notify: wanted,
+    run: current, runs: runRows, loads: loaded, busy: keys, flash: shownFlash, starting: pending, confirm, watching,
+    picks: chosenPicks, runTrouble: troubleRun, expanded: opened, now, columns, rows,
+    canOpenCodex: surface !== 'mobile', notify: wanted,
   }
 }
 
-function flashLine(els: Els, $: Engine, s: Snapshot, scope: Page): JSX.Element | null {
+function flashLine(els: Els, $: Engine, s: Snapshot): JSX.Element | null {
   const { Box, Text, Button } = els
   const shown = s.flash
-  // A flash from before the tabs said `home`: it shows in whichever tab is open.
-  if (!shown || (shown.scope !== scope && shown.scope !== 'home')) return null
+  if (!shown) return null
   if (shown.tone === 'done') {
     return s.now - shown.at > FLASH_MS ? null : <Text color="success">✓ {shown.text}</Text>
   }
@@ -2859,7 +2392,7 @@ function mergeCard(c: RunCtx, $: Engine, ready: TaskView[]): JSX.Element {
                 plain
                 dimColor
                 label={busyLabel(c, `codex-${task.thread}`, 'Open the chat in Codex', 'Opening…')}
-                onPress={() => inBackground(openInCodex($, task.thread ?? '', 'run'))}
+                onPress={() => inBackground(openInCodex($, task.thread ?? ''))}
               />
             ) : null}
           </Box>
@@ -3104,7 +2637,7 @@ function workingCard(c: RunCtx, $: Engine, task: TaskView): JSX.Element {
               key={`codex-${task.id}`}
               hotkey={openKey}
               label={busyLabel(c, `codex-${thread}`, keyed('Open in Codex', openKey), 'Opening…')}
-              onPress={() => inBackground(openInCodex($, thread, 'run'))}
+              onPress={() => inBackground(openInCodex($, thread))}
             />
           ) : null}
           {stoppable && !asked && (
@@ -3172,7 +2705,7 @@ function taskRow(c: RunCtx, $: Engine, state: TaskState): JSX.Element {
               plain
               dimColor
               label={busyLabel(c, `codex-${thread}`, 'Open in Codex', 'Opening…')}
-              onPress={() => inBackground(openInCodex($, thread, 'run'))}
+              onPress={() => inBackground(openInCodex($, thread))}
             />
           ) : null}
           {hasDetails(task) ? (
@@ -3251,7 +2784,7 @@ function finishedCard(c: RunCtx, $: Engine): JSX.Element {
                     plain
                     dimColor
                     label={busyLabel(c, `codex-${item.thread}`, 'Open in Codex', 'Opening…')}
-                    onPress={() => inBackground(openInCodex($, item.thread, 'run'))}
+                    onPress={() => inBackground(openInCodex($, item.thread))}
                   />
                 </Box>
               ) : null}
@@ -3513,7 +3046,7 @@ function runView(els: Els, $: Engine, s: Snapshot, r: RunView): JSX.Element {
                 plain
                 dimColor
                 label={busyLabel(c, `codex-${orchestratorThread}`, 'Open in Codex', 'Opening…')}
-                onPress={() => inBackground(openInCodex($, orchestratorThread, 'run'))}
+                onPress={() => inBackground(openInCodex($, orchestratorThread))}
               />
             ) : null}
             <Button
@@ -3539,17 +3072,6 @@ function runView(els: Els, $: Engine, s: Snapshot, r: RunView): JSX.Element {
         </Box>
       )}
       {troubleLine(els, s.runTrouble, 'the run')}
-      {s.paused && !s.watching && (
-        <Box flexDirection="row" justifyContent="space-between" alignItems="center" gap={1} borderStyle="round" borderColor="warning" paddingX={1}>
-          <Box flexShrink={1}>
-            <Text>
-              Updates to Claude are on hold{s.held > 0 ? `: ${plural(s.held, 'update')} waiting` : ''}. Claude acts on them once you
-              resume.
-            </Text>
-          </Box>
-          <Button key="resume-delivery" label="Resume updates" onPress={() => inBackground(setPaused($, false))} />
-        </Box>
-      )}
       {needsYou.length > 0 && (
         <Box flexDirection="column" gap={1}>
           <Text weight="semibold" color="warning">
@@ -3601,286 +3123,6 @@ function runView(els: Els, $: Engine, s: Snapshot, r: RunView): JSX.Element {
   )
 }
 
-// P0 and P1 block a merge; P2 is to fix soon; P3 is minor.
-const PRIORITY_COLORS: Record<number, string> = { 0: 'error', 1: 'error', 2: 'warning', 3: 'inactive' }
-
-// Codex's findings in a review, each with its priority, place and why. For a pull request the person picks which to
-// post there, and confirms before anything reaches GitHub.
-function reviewCard(els: Els, $: Engine, s: Snapshot, current: RoomView, review: ReviewView): JSX.Element | null {
-  const { Box, Text, Button, Markdown } = els
-  const result = review.result
-  if (!result) return null
-  const findings: ReviewFinding[] = result.findings
-  const pickKey = `review:${current.name}`
-  const mine = s.picks[pickKey] ?? []
-  const allPicked = findings.length > 0 && findings.every(item => mine.includes(item.id))
-  const posted = result.posted ?? null
-  const canPost = review.kind === 'pr' && !posted && findings.length > 0
-  const confirmKey = `post-review-${current.name}`
-  const verdict =
-    result.verdict === 'incorrect'
-      ? { text: 'Codex finds the change incorrect', color: 'warning' }
-      : result.verdict === 'correct'
-        ? { text: 'Codex finds the change correct', color: 'success' }
-        : null
-  return (
-    <Box key="review-card" flexDirection="column" gap={1} borderStyle="round" borderColor={verdict?.color ?? 'ide'} paddingX={1}>
-      <Box flexDirection="column">
-        <Box flexDirection="row" alignItems="center" gap={1}>
-          {agentIcon(els, 'codex')}
-          <Text weight="semibold">{findings.length === 0 ? 'No findings' : plural(findings.length, 'finding')}</Text>
-          {verdict ? (
-            <Text size="footnote" color={verdict.color}>
-              · {verdict.text}
-            </Text>
-          ) : null}
-        </Box>
-        {result.explanation ? (
-          <Text size="footnote" dimColor>
-            {result.explanation}
-          </Text>
-        ) : null}
-        {findings.length > 0 ? (
-          <Text size="footnote" dimColor>
-            Claude checks each finding in the code and tells you in the chat which ones hold.
-          </Text>
-        ) : null}
-      </Box>
-      {findings.map(item => {
-        const picked = mine.includes(item.id)
-        const lines = item.line_end && item.line_end !== item.line_start ? `${item.line_start}–${item.line_end}` : `${item.line_start}`
-        return (
-          <Box key={`finding-${item.id}`} flexDirection="row" alignItems="flex-start" gap={1}>
-            {canPost ? (
-              <Button
-                key={`pick-finding-${item.id}`}
-                plain
-                label={picked ? '☑' : '☐'}
-                onPress={() => inBackground(togglePick($, pickKey, item.id))}
-              />
-            ) : (
-              <Text>{item.id}.</Text>
-            )}
-            <Box flexDirection="column" flexShrink={1}>
-              <Text>
-                <Text color={PRIORITY_COLORS[item.priority]} weight="semibold">
-                  P{item.priority}
-                </Text>
-                <Text dimColor> {item.kind} · </Text>
-                {item.title}
-              </Text>
-              <Text size="footnote" dimColor>
-                {item.file}:{lines} · {Math.round((item.confidence ?? 0) * 100)}% sure
-              </Text>
-              <Markdown key={`finding-${item.id}-body`} text={item.body} />
-            </Box>
-          </Box>
-        )
-      })}
-      {posted ? (
-        <Text size="footnote" color="success">
-          ✓ Posted {plural(posted.items.length, 'finding')} to the pull request{posted.inline ? '' : " in the review's text"}.
-        </Text>
-      ) : null}
-      {canPost && s.confirm === confirmKey ? (
-        <Box flexDirection="column" gap={1}>
-          <Text color="warning">
-            Post {plural(mine.length, 'finding')} as a review on PR #{review.pr?.number}? Everyone who can see the pull request sees
-            them.
-          </Text>
-          <Box flexDirection="row" gap={1}>
-            <Button
-              key="post-review-confirm"
-              variant="primary"
-              label={s.busy.includes(`post-${current.name}`) ? 'Posting…' : 'Post to GitHub'}
-              onPress={() => inBackground(postReview($, current, mine))}
-            />
-            <Button key="post-review-cancel" plain label="Cancel" onPress={() => inBackground(update($, confirming, () => null))} />
-          </Box>
-        </Box>
-      ) : canPost ? (
-        <Box flexDirection="row" flexWrap="wrap" gap={1} alignItems="center">
-          {mine.length > 0 ? (
-            <Button
-              key="post-review"
-              variant="primary"
-              label={`Post ${plural(mine.length, 'finding')} to PR #${review.pr?.number}`}
-              onPress={() => inBackground(update($, confirming, () => confirmKey))}
-            />
-          ) : (
-            <Text size="footnote" dimColor>
-              Tick the findings to post to the pull request.
-            </Text>
-          )}
-          {findings.length > 1 ? (
-            <Button
-              key="pick-all-findings"
-              plain
-              dimColor
-              label={allPicked ? 'Clear picks' : 'Pick all'}
-              onPress={() => inBackground(update($, picks, all => ({ ...all, [pickKey]: allPicked ? [] : findings.map(item => item.id) })))}
-            />
-          ) : null}
-        </Box>
-      ) : null}
-    </Box>
-  )
-}
-
-function chatView(els: Els, $: Engine, s: Snapshot, current: RoomView): JSX.Element {
-  const { Box, Text, Button, Markdown } = els
-  const Input = inputOf(els)
-  const status = chatStatus(current)
-  const isFull = current.used >= current.limit
-  const sending = s.busy.some(key => key.startsWith('say-'))
-  const mine = s.entries.filter(entry => entry.room === current.name)
-  const { shown, hidden } = fitEntries(mine, s.columns - 2, s.rows - 14)
-  const review = current.review ?? null
-  // A review's answer shows as its findings card, so its plain message is left out.
-  const reviewedIn = review?.result?.n
-  return (
-    <Box flexDirection="column" gap={1}>
-      <Box flexDirection="column">
-        <Box flexDirection="row" justifyContent="space-between" alignItems="center" gap={1}>
-          <Text size="footnote" dimColor>
-            {review ? 'Codex reviews, read-only' : 'Talking with Codex'}
-          </Text>
-          <Button key="all-chats" plain dimColor label="← All chats" onPress={() => inBackground(setExpanded($, ['all-chats'], true))} />
-        </Box>
-        <Text size="heading" weight="semibold">
-          {review ? review.label : (current.threadName ?? 'Codex thread')}
-        </Text>
-        <Box flexDirection="row" justifyContent="space-between" alignItems="center" gap={1}>
-          <Box flexDirection="row" alignItems="center" gap={1} flexShrink={1}>
-            {current.turnRunning ? workingMark(els, 'codex') : <Text color={status.color}>{status.glyph}</Text>}
-            <Text size="footnote" color={current.turnRunning ? undefined : status.color}>
-              {review && current.turnRunning ? 'Codex is reviewing…' : status.text}
-            </Text>
-          </Box>
-          {s.canOpenCodex && (
-            <Button
-              key="codex-thread"
-              plain
-              dimColor
-              label={s.busy.includes(`codex-${current.thread}`) ? 'Opening…' : 'Open in Codex'}
-              onPress={() => inBackground(openInCodex($, current.thread, 'chat'))}
-            />
-          )}
-        </Box>
-      </Box>
-      {troubleLine(els, s.chatTrouble, 'Codex')}
-      {s.paused && (
-        <Text color="warning">
-          Codex's answers are on hold{s.held > 0 ? `: ${s.held} waiting` : ''}. Claude gets them when you resume.
-        </Text>
-      )}
-      {isFull && !current.closed && (
-        <Box flexDirection="column" gap={1} borderStyle="round" borderColor="warning" paddingX={1}>
-          <Box flexDirection="column">
-            <Text weight="semibold">Claude and Codex used their {current.limit} messages</Text>
-            <Text size="footnote" dimColor>
-              They wait for you now. Allow more, or write to Codex yourself, which starts the count again.
-            </Text>
-          </Box>
-          <Button
-            key="more"
-            variant="primary"
-            label={s.busy.includes('more') ? 'Adding…' : 'Allow 10 more'}
-            onPress={() => inBackground(act($, 'more', 'chat', () => allowMore($)))}
-          />
-        </Box>
-      )}
-      {review ? reviewCard(els, $, s, current, review) : null}
-      {!review && mine.every(entry => entry.from === 'notice') && (
-        <Text dimColor>No messages yet. Ask Claude to discuss something with Codex, or write to Codex below.</Text>
-      )}
-      {hidden > 0 && (
-        <Text size="footnote" dimColor>
-          {plural(hidden, 'earlier message')} not shown.
-        </Text>
-      )}
-      {shown.map(entry => {
-        if (reviewedIn && entry.from === 'codex' && entry.numbers.includes(reviewedIn)) return null
-        if (entry.from === 'notice') {
-          return (
-            <Text size="footnote" dimColor>
-              {entry.text}
-            </Text>
-          )
-        }
-        const who = speaker(entry)
-        // Each message is a card in its speaker's color: Claude orange, Codex blue, you plain.
-        return (
-          <Box key={entry.id} flexDirection="column" borderStyle="round" borderColor={who.color ?? 'inactive'} paddingX={1}>
-            <Box flexDirection="row" alignItems="center" gap={1}>
-              {entry.from === 'claude' || entry.from === 'codex' ? agentIcon(els, entry.from) : null}
-              <Text size="footnote">
-                <Text color={who.color} weight="semibold">
-                  {who.label}
-                </Text>
-                <Text dimColor>
-                  {who.refs ? ` · ${who.refs}` : ''} · {since(entry.at / 1000, s.now)}
-                </Text>
-              </Text>
-            </Box>
-            <Markdown key={`md-${entry.id}`} text={entryText(entry.text)} />
-          </Box>
-        )
-      })}
-      {current.closed ? (
-        <Box flexDirection="column" gap={1}>
-          <Text dimColor>This conversation has ended. Start a new one from Tandem's home.</Text>
-          <Button key="chat-forget" label="Back to Tandem" onPress={() => inBackground(forgetRoom($))} />
-        </Box>
-      ) : Input ? (
-        <Input
-          key="say"
-          rows={2}
-          placeholder="Write to Codex as yourself"
-          submitLabel="Send"
-          onSubmit={value => {
-            if (value.trim()) inBackground(sayToCodex($, value.trim()))
-          }}
-        />
-      ) : (
-        <Text dimColor>Writing to Codex yourself needs the desktop app or the terminal.</Text>
-      )}
-      {sending && (
-        <Text size="footnote" dimColor>
-          Sending…
-        </Text>
-      )}
-      {!current.closed && (
-        <Box flexDirection="column" gap={1}>
-          <Box flexDirection="row" gap={1}>
-            <Button
-              key="pause"
-              label={s.paused ? 'Resume messages to Claude' : 'Hold messages to Claude'}
-              onPress={() => inBackground(setPaused($, !s.paused))}
-            />
-            <Button
-              key="close"
-              label={s.busy.includes('close') ? 'Disconnecting…' : 'Disconnect'}
-              onPress={() => inBackground(act($, 'close', 'chat', () => closeRoom($)))}
-            />
-            <Button
-              key="archive-chat"
-              label={s.busy.includes(`archive-${current.thread}`) ? 'Archiving…' : 'Archive thread'}
-              onPress={() => inBackground(archiveThread($, current.thread, quote(current.threadName ?? 'the Codex thread')))}
-            />
-          </Box>
-          <Text size="footnote" dimColor>
-            Hold messages to Claude keeps Codex's answers, and a run's updates, from Claude until you resume. Disconnect stops
-            Claude from following this thread, which stays in the Codex app. Archive thread also moves it to
-            Codex's archived threads (the Archived tab restores it). {current.used} of {current.limit} agent messages used; when
-            they run out, Claude and Codex wait for you.
-          </Text>
-        </Box>
-      )}
-    </Box>
-  )
-}
-
 // The run's tasks as one bar: done, then working, then the rest.
 function progressBar(els: Els, r: RunView, width: number): JSX.Element {
   const { Text } = els
@@ -3926,16 +3168,13 @@ function runBand(r: RunView, watching: boolean, now: number): Band {
   return { glyph: '●', color: working ? 'ide' : 'claude', text: `${head.text} in ${goal}`, urgent: false, action: 'Open' }
 }
 
-function chatBand(current: RoomView, waiting: number, isPaused: boolean): Band {
+function chatBand(current: RoomView): Band {
   const name = current.threadName ?? 'Codex thread'
   if (current.used >= current.limit && !current.closed) {
-    return { glyph: '◆', color: 'warning', text: `Your turn: allow more messages with ${name}`, urgent: true, action: 'Review' }
-  }
-  if (isPaused && waiting > 0) {
-    return { glyph: '◆', color: 'warning', text: `${plural(waiting, 'answer')} from ${name} on hold`, urgent: true, action: 'Review' }
+    return { glyph: '◆', color: 'warning', text: `Your turn: allow more messages with ${name} (/tandem more)`, urgent: true, action: 'Open in Codex' }
   }
   const status = chatStatus(current)
-  return { glyph: status.glyph, color: status.color, text: `${name}: ${status.text}`, urgent: false, action: 'Open' }
+  return { glyph: status.glyph, color: status.color, text: `${name}: ${status.text}`, urgent: false, action: 'Open in Codex' }
 }
 
 // --- Tandem's messages in Claude's conversation ------------------------------------------------------
@@ -3978,8 +3217,8 @@ export const register: Register = on => {
     await $.command.register({
       name: 'tandem',
       description:
-        'Talk live with a Codex thread, have Codex review a change, or orchestrate Codex workers: open the panel, list, connect, ' +
-        'start, review, orchestrate, close',
+        'Orchestrate Codex workers in the panel, talk live with a Codex thread, or have Codex review a change: open the panel, ' +
+        'orchestrate, list, connect, start, review, post findings, allow more messages, close',
       argumentHint: USAGE,
     })
     await $.tool.register({
@@ -4028,7 +3267,7 @@ export const register: Register = on => {
         'URL), a branch, a commit, or with no target the uncommitted changes. Codex checks the bugs the change introduces, how ' +
         'it fits the codebase, tests, security and performance; its findings come back here as a new message, and you check ' +
         "each one in the code before telling the user. Uses the user's Codex limits. Posting findings to GitHub is the user's, " +
-        'from the Tandem panel.',
+        'with /tandem post <numbers>.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -4314,7 +3553,7 @@ export const register: Register = on => {
     await update($, starting, () => null)
     await update($, runTrouble, () => null)
     await update($, confirming, () => null)
-    inBackground(openPane($, 'run'))
+    inBackground(openPane($))
     return reply(`${started.text}\n\n${await orchestratorGuide($)}`)
   }).catch(toolFailed)
 
@@ -4322,7 +3561,7 @@ export const register: Register = on => {
     if (!(await read($, run))) return reply('No run is open: start one with orch_start.', true)
     if (await read($, observing)) return reply(WATCHED_ONLY, true)
     const planned = await orchCall($, 'plan', [], JSON.stringify({ tasks: e.tasks ?? [] }))
-    if (planned.ok) inBackground(openPane($, 'run'))
+    if (planned.ok) inBackground(openPane($))
     return reply(planned.text, !planned.ok)
   }).catch(toolFailed)
 
@@ -4353,7 +3592,7 @@ export const register: Register = on => {
   }).catch(toolFailed)
 
   on('tool.call', { tool: 'mcp__tandem__connect' }, async ($, e) => {
-    const done = await connect($, String(e.thread ?? ''), 'Claude')
+    const done = await connect($, String(e.thread ?? ''))
     return reply(done.text, !done.ok)
   }).catch(toolFailed)
 
@@ -4364,7 +3603,6 @@ export const register: Register = on => {
 
   on('tool.call', { tool: 'mcp__tandem__review' }, async ($, e) => {
     const started = await startReview($, String(e.target ?? ''), String(e.focus ?? ''))
-    if (started.ok) inBackground(openPane($, 'chat'))
     return reply(started.text, !started.ok)
   }).catch(toolFailed)
 
@@ -4390,15 +3628,12 @@ export const register: Register = on => {
       return { text: listed.error ? `Could not list Codex threads: ${listed.error}` : listThreads(listed.rows) }
     }
     if (verb === 'connect') {
-      const done = await connect($, rest.join(' '), 'command')
-      if (done.ok) inBackground(openPane($, 'chat'))
-      return { text: done.text }
+      return { text: (await connect($, rest.join(' '))).text }
     }
     if (verb === 'close') return { text: (await closeRoom($)).text }
     if (verb === 'new') {
       const worktree = rest[0] === '--worktree'
       const started = await startCodex($, (worktree ? rest.slice(1) : rest).join(' '), worktree)
-      if (started.ok) inBackground(openPane($, 'chat'))
       return { text: started.text }
     }
     if (verb === 'orchestrate') {
@@ -4406,14 +3641,15 @@ export const register: Register = on => {
       if (!goal) return { text: 'Usage: /tandem orchestrate <what the run should achieve>' }
       const at = await $.clock.now()
       await update($, starting, () => ({ kind: 'goal' as const, text: goal, at }))
-      inBackground(openPane($, 'run'))
+      inBackground(openPane($))
       inBackground(orchestratePrompt($, goal).then(prompt => submitPrompt($, prompt)))
       return { text: 'Tandem orchestrator: Claude first asks how you want the work organized.' }
     }
-    if (verb === 'review') {
-      const started = await startReview($, rest.join(' '))
-      if (started.ok) inBackground(openPane($, 'chat'))
-      return { text: started.text }
+    if (verb === 'review') return { text: (await startReview($, rest.join(' '))).text }
+    // The person's own gates for a conversation, which no agent passes: more messages, and posting a review's findings.
+    if (verb === 'more' || verb === 'post') {
+      if (!PERSON.includes(e.origin.kind)) return { text: `/tandem ${verb} is the user's: type it yourself.` }
+      return { text: (verb === 'more' ? await allowMore($) : await postReview($, rest.join(','))).text }
     }
     if (verb !== '') {
       return { text: `Usage: /tandem ${USAGE}` }
@@ -4426,18 +3662,11 @@ export const register: Register = on => {
     const els = $.ui.resolve(e)
     const s = await snapshot($, e.props.bodyColumns, e.props.scroll.bodyRows, e.surface)
     drawingOn = e.surface
-    const tab = tabFor(s)
     const { Box } = els
-    let body: JSX.Element
-    if (tab === 'archived') body = archivedTab(els, $, s)
-    // "All chats" shows the list while the conversation stays connected.
-    else if (tab === 'chat') body = s.room && !s.expanded.includes('all-chats') ? chatView(els, $, s, s.room) : chatStart(els, $, s)
-    else body = s.run ? runView(els, $, s, s.run) : orchestrateStart(els, $, s)
     return (
       <Box flexDirection="column" gap={1} padding={1}>
-        {tabBar(els, $, s, tab)}
-        {flashLine(els, $, s, tab)}
-        {body}
+        {flashLine(els, $, s)}
+        {s.run ? runView(els, $, s, s.run) : orchestrateStart(els, $, s)}
       </Box>
     )
   })
@@ -4450,10 +3679,9 @@ export const register: Register = on => {
     const band = orchestrated
       ? runBand(orchestrated, await read($, observing), now)
       : current
-        ? chatBand(current, (await read($, held)).length, await read($, paused))
+        ? chatBand(current)
         : null
     if (!band) return next(e)
-    const page: Page = orchestrated ? 'run' : 'chat'
     const els = $.ui.resolve(e)
     const { Box, Text, Button } = els
     // While Codex works, the band shows it moving: a spinner, the run's progress and the last step a worker took.
@@ -4481,7 +3709,13 @@ export const register: Register = on => {
             </Text>
           </Box>
           <Box flexShrink={0}>
-            <Button key="open" plain label={band.action} onPress={() => inBackground(openPane($, page, band.urgent))} />
+            <Button
+              key="open"
+              plain
+              label={band.action}
+              // A conversation has no view in the panel: its thread opens in the Codex app.
+              onPress={() => inBackground(orchestrated || !current ? openPane($, band.urgent) : openInCodex($, current.thread))}
+            />
           </Box>
         </Box>
         {live && orchestrated ? (

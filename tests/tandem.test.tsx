@@ -55,6 +55,12 @@ function prompts(on: On) {
   return texts
 }
 
+// The person types /tandem <args>; `kind` says where the command came from instead.
+async function typed($: Engine, args: string, kind = 'composer'): Promise<string> {
+  const origin = { kind } as { kind: 'composer' }
+  return (await $.command.run({ command: 'tandem', args, origin, presentation: { isFullscreen: false, columns: 80 } })).text ?? ''
+}
+
 // Every Text the drawing shows, as one string: what a person reads.
 async function shown(ui: { findAll: (query: { type: string }) => Promise<{ text: string }[]> }) {
   return (await ui.findAll({ type: 'Text' })).map(found => found.text).join('\n')
@@ -118,7 +124,7 @@ test('connect joins the room Codex opened for the thread', async ($, on) => {
   expect(send[send.indexOf('--room') + 1]).toBe('from-codex')
 })
 
-test('a Codex answer reaches Claude as a prompt and shows in the panel', async ($, on) => {
+test('a Codex answer reaches Claude as a prompt', async ($, on) => {
   const clock = engine(on)
   const answer = { ...QUIET, events: [{ type: 'answer', numbers: [1], text: 'Pages 1-4 match the design.' }] }
   const calls = core(on, [answer])
@@ -136,78 +142,19 @@ test('a Codex answer reaches Claude as a prompt and shows in the panel', async (
   expect(texts.length).toBe(1)
   expect(texts[0]).toContain('Codex answered #1')
   expect(texts[0]).toContain('not from the user')
-  for (const surface of SURFACES) {
-    const ui = await $.ui.mount({ ...PANE, surface })
-    expect(await ui.find({ type: 'Markdown', text: /Which pages differ\?/ })).toBeDefined()
-    expect(await ui.find({ type: 'Markdown', text: /Pages 1-4 match the design/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: 'answer to #1' })).toBeDefined()
-    await ui.unmount()
-  }
 })
 
-test('the person can message Codex from the panel', async ($, on) => {
+test("the band's button opens a conversation's thread in the Codex app", async ($, on) => {
   engine(on)
   const calls = core(on, [])
   await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
   await $.tool.call({ tool: 'mcp__tandem__connect', thread: '1' })
 
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect(await ui.find({ type: 'Text', text: /No messages yet/ })).toBeDefined()
-  await ui.input({ key: 'say', text: 'Keep Figma read-only for now' })
-  expect(await ui.find({ type: 'Text', text: /No messages yet/ })).toBeUndefined()
-  await ui.unmount()
-
-  const sent = calls.find(c => c[1] === 'send')
-  expect(sent?.includes('user')).toBe(true)
-  expect(sent?.includes('--message=Keep Figma read-only for now')).toBe(true)
-})
-
-test('a message the core could not send is shown in the conversation', async ($, on) => {
-  engine(on)
-  core(on, [], undefined, { send: () => failed('tandem: codex queue did not answer in 30s') })
-  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'mcp__tandem__connect', thread: '1' })
-
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  await ui.input({ key: 'say', text: 'Are you there?' })
-
-  expect(await ui.find({ type: 'Text', text: /Could not send your message: codex queue did not answer in 30s/ })).toBeDefined()
-  await ui.unmount()
-})
-
-test('Open in Codex opens the thread in the Codex app', async ($, on) => {
-  engine(on)
-  const calls = core(on, [])
-  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'mcp__tandem__connect', thread: '1' })
-
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await ui.press({ key: 'codex-thread' })
-  await ui.unmount()
-  const phone = await $.ui.mount({ ...PANE, surface: 'mobile' })
-  expect(await phone.find({ key: 'codex-thread' })).toBeUndefined()
-  await phone.unmount()
-
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await shown(band)).toContain('Review the settings screen')
+  await band.press({ key: 'open' })
+  await band.unmount()
   expect(calls.some(c => c[0] === '/usr/bin/open' && c[1] === `codex://threads/${THREAD}`)).toBe(true)
-})
-
-test('pause holds Codex answers until resumed', async ($, on) => {
-  const clock = engine(on)
-  core(on, [{ ...QUIET, events: [{ type: 'answer', numbers: [1], text: 'Done.' }] }])
-  const texts = prompts(on)
-  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'mcp__tandem__connect', thread: '1' })
-
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await ui.press({ key: 'pause' })
-  await clock.advance(2000)
-  await clock.advance(0)
-  expect(texts.length).toBe(0)
-  expect(await ui.find({ type: 'Text', text: /answers are on hold: 1 waiting/ })).toBeDefined()
-
-  await ui.press({ key: 'pause' })
-  expect(texts.length).toBe(1)
-  await ui.unmount()
 })
 
 test('Claude can start a new Codex thread in its own worktree', async ($, on) => {
@@ -221,9 +168,6 @@ test('Claude can start a new Codex thread in its own worktree', async ($, on) =>
   const started = calls.find(c => c[1] === 'new-codex')
   expect(started?.includes('--worktree')).toBe(true)
   expect(started?.includes('--message=Review the retry plan')).toBe(true)
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect(await ui.find({ type: 'Markdown', text: /Review the retry plan/ })).toBeDefined()
-  await ui.unmount()
 })
 
 const REVIEW = {
@@ -248,7 +192,7 @@ const REVIEWED = {
   },
 }
 
-test('Claude has Codex review a pull request; the findings show in the panel and the user posts the ones they pick', async ($, on) => {
+test('Claude has Codex review a pull request, and only the user posts the findings they pick', async ($, on) => {
   const clock = engine(on)
   const calls = core(on, [REVIEWED], 'unused', {
     review: () =>
@@ -268,43 +212,14 @@ test('Claude has Codex review a pull request; the findings show in the panel and
   // Claude checks each finding before the user hears of it.
   expect(texts.length).toBe(1)
   expect(texts[0]).toContain('check each finding in the code yourself')
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  const text = await shown(ui)
-  expect(text).toContain('PR #7 “Add the greeting”')
-  expect(text).toContain('2 findings')
-  expect(text).toContain('Codex finds the change incorrect')
-  expect(text).toContain('Handle an empty name')
-  expect(text).toContain('greet.py:1–2 · 70% sure')
-  expect(text.indexOf('Handle an empty name')).toBeLessThan(text.indexOf('Use the existing say helper'))
-  expect(await ui.find({ type: 'Markdown', text: /Codex reviewed PR #7/ })).toBeUndefined() // the card stands for it
+  expect(texts[0]).toContain('/tandem post <numbers>')
 
-  await ui.press({ key: 'pick-finding-1' })
-  await ui.press({ key: 'post-review' })
-  expect(await shown(ui)).toContain('Post 1 finding as a review on PR #7?')
-  expect(calls.some(c => c[1] === 'review-post')).toBe(false) // nothing reaches GitHub before the user confirms
-  await ui.press({ key: 'post-review-confirm' })
+  // An agent cannot post: the command is the user's.
+  expect(await typed($, 'post 1', 'peer')).toContain("is the user's")
+  expect(calls.some(c => c[1] === 'review-post')).toBe(false)
+  expect(await typed($, 'post 1')).toContain('Posted 1 finding to the pull request, each on its lines.')
   const post = calls.find(c => c[1] === 'review-post') ?? []
   expect([post[post.indexOf('--room') + 1], post[post.indexOf('--items') + 1]]).toEqual(['review-pr-7', '1'])
-  expect(await shown(ui)).toContain('Posted 1 finding to the pull request, each on its lines.')
-  await ui.unmount()
-})
-
-test('All chats shows the list while the conversation stays connected, and Back to it returns', async ($, on) => {
-  engine(on)
-  core(on, [])
-  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
-  await $.tool.call({ tool: 'mcp__tandem__connect', thread: '1' })
-
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect(await shown(ui)).toContain('Talking with Codex')
-  await ui.press({ key: 'all-chats' })
-  const list = await shown(ui)
-  expect(list).toContain('Connected to Review the settings screen')
-  expect(list).toContain('Talk with Codex')
-  expect(list).toContain('Review a change')
-  await ui.press({ key: 'back-to-chat' })
-  expect(await shown(ui)).toContain('Talking with Codex')
-  await ui.unmount()
 })
 
 const RUN = {
@@ -551,9 +466,6 @@ test('working agents show what they are doing, with a spinner where the surface 
   expect(text).toContain('0 of 1 task done, 1 working')
   expect(text).toContain('Theme tokens: Ran npm test')
   await band.unmount()
-  const tab = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect(await tab.find({ key: 'tab-run' })).toBeDefined()
-  await tab.unmount()
 })
 
 test('the plan shows each task in full when asked, and a stopping task says where to stop it', async ($, on) => {
@@ -911,7 +823,7 @@ test('a run a Codex thread conducts is shown to answer there, not decided here',
   await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await ui.press({ key: 'tab-run' }) // opening the tab lists the project's runs
+  await ui.press({ key: 'runs-load' })
   await ui.press({ key: 'watch-r-codex1' })
 
   expect(await ui.find({ type: 'Text', text: /Codex is waiting for your answer in its thread/ })).toBeDefined()
@@ -959,7 +871,7 @@ test("a session whose folder is gone says so, not that Tandem's script is missin
   await $.session.start({ cwd: '/gone', surface: 'desktop', isInteractive: true })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await ui.press({ key: 'tab-chat' }) // opening the tab lists the project's threads
+  await ui.press({ key: 'runs-load' })
 
   const text = await shown(ui)
   expect(text).toContain("this session's folder no longer exists (/gone): it was moved or removed")
@@ -1179,7 +1091,7 @@ test("Codex's answer shows as a Codex card in Claude's conversation", async ($, 
   }
 })
 
-test('the tabs offer both ways in, and the Codex chat tab hides run workers', async ($, on) => {
+test("the panel is the orchestrator alone, and Claude's thread list leaves run workers out", async ($, on) => {
   const clock = engine(on)
   on('process.run', (_, e) => {
     const argv = [...e.argv]
@@ -1199,53 +1111,21 @@ test('the tabs offer both ways in, and the Codex chat tab hides run workers', as
 
   for (const surface of SURFACES) {
     const empty = await $.ui.mount({ ...PANE, surface })
-    expect(await empty.drawn()).toBeDefined()
-    await empty.press({ key: 'tab-run' })
     expect(await empty.find({ type: 'Text', text: /Orchestrate a goal/ })).toBeDefined()
-    expect(await empty.find({ type: 'Text', text: /Talk with Codex/ })).toBeUndefined()
-    await empty.press({ key: 'tab-chat' })
-    expect(await empty.find({ type: 'Text', text: /Talk with Codex/ })).toBeDefined()
+    expect(await empty.find({ key: 'tab-chat' })).toBeUndefined()
     await empty.unmount()
   }
 
-  await $.tool.call({ tool: 'mcp__tandem__threads' })
-  const phone = await $.ui.mount({ ...PANE, surface: 'mobile' })
-  expect(await phone.find({ key: `thread-${THREAD}` })).toBeDefined()
-  expect(await phone.find({ key: 'thread-01a17000-0000-7000-8000-000000000002' })).toBeUndefined()
-  await phone.unmount()
+  const listed = JSON.stringify(await $.tool.call({ tool: 'mcp__tandem__threads' }))
+  expect(listed).toContain('Plan the auth flow')
+  expect(listed).not.toContain('Theme tokens')
 
   const wide = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await wide.press({ key: 'tab-run' })
   await wide.input({ key: 'goal', text: 'Add dark mode' })
   await clock.advance(0)
   expect(await wide.find({ type: 'Text', text: 'Setting up your run' })).toBeDefined()
   await wide.unmount()
   expect(texts.some(text => text.startsWith('[Tandem orchestrator]') && text.includes('Add dark mode'))).toBe(true)
-})
-
-test('the Codex chat tab says when it is loading threads, and why it could not', async ($, on) => {
-  const clock = engine(on)
-  let broken = false
-  on('process.run', async (_, e) => {
-    const argv = [...e.argv]
-    if (argv[1] !== 'threads') return ok('[]')
-    await clock.sleep(1000)
-    return broken ? failed('tandem: codex is not signed in') : ok('[]')
-  })
-  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
-
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  await ui.press({ key: 'tab-chat' }) // opening the tab loads its threads
-  expect(await ui.find({ type: 'Text', text: /Looking for this project's Codex threads/ })).toBeDefined()
-  await clock.advance(1000)
-  expect(await ui.find({ type: 'Text', text: /No Codex threads in this project yet/ })).toBeDefined()
-
-  broken = true
-  await ui.press({ key: 'threads-refresh' })
-  await clock.advance(1000)
-  expect(await ui.find({ type: 'Text', text: /Could not list this project's Codex threads: codex is not signed in/ })).toBeDefined()
-  expect(await ui.find({ key: 'threads-retry' })).toBeDefined()
-  await ui.unmount()
 })
 
 test('a finished run says where the work is and how to merge it, on every surface', async ($, on) => {
@@ -1315,7 +1195,7 @@ test('the header offers more worker turns once they run low, before Tandem refus
   await ui.unmount()
 })
 
-test('a conversation that used its messages waits for the person, in the band and the panel', async ($, on) => {
+test('a conversation that used its messages waits for the person, who allows more with /tandem more', async ($, on) => {
   const clock = engine(on)
   const calls = core(on, [{ ...QUIET, used: 20, limit: 20 }])
   await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
@@ -1324,14 +1204,12 @@ test('a conversation that used its messages waits for the person, in the band an
   await clock.advance(0)
 
   const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect(await shown(band)).toContain('Your turn: allow more messages with Review the settings screen')
+  expect(await shown(band)).toContain('Your turn: allow more messages with Review the settings screen (/tandem more)')
   await band.unmount()
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect(await ui.find({ type: 'Text', text: 'Claude and Codex used their 20 messages' })).toBeDefined()
-  await ui.press({ key: 'more' })
+  expect(await typed($, 'more', 'plugin')).toContain("is the user's") // no agent allows itself more
+  expect(calls.some(c => c[1] === 'open' && c.includes('--limit'))).toBe(false)
+  expect(await typed($, 'more')).toContain('Allowed 10 more messages, 30 in all')
   expect(calls.some(c => c[1] === 'open' && c.includes('--limit') && c.includes('30'))).toBe(true)
-  expect(await ui.find({ type: 'Text', text: /Allowed 10 more messages, 30 in all/ })).toBeDefined()
-  await ui.unmount()
 })
 
 test("run updates show as Tandem's own rows in Claude's conversation, without run ids", async ($, on) => {
@@ -1373,55 +1251,17 @@ test('the run says where its workers run', async ($, on) => {
   await ui.unmount()
 })
 
-test('a thread is archived from the Codex chat tab and restored from the Archived tab', async ($, on) => {
-  engine(on)
-  const calls: string[][] = []
-  let archived = false
-  on('process.run', (_, e) => {
-    const argv = [...e.argv]
-    calls.push(argv)
-    if (argv[1] === 'threads') {
-      const row = { id: THREAD, name: null, preview: 'Plan the auth flow', updated_ts: 1, open_in: null, worker: false }
-      return ok(JSON.stringify(argv.includes('--archived') === archived ? [row] : []))
-    }
-    if (argv[1] === 'archive' || argv[1] === 'unarchive') archived = argv[1] === 'archive'
-    return ok('')
-  })
-  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
-
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await ui.press({ key: 'tab-chat' }) // opening the tab loads its threads
-  expect(await ui.find({ type: 'Text', text: /Plan the auth flow/ })).toBeDefined() // a thread with no name, by its first words
-  await ui.press({ key: `archive-${THREAD}` })
-  expect(calls.some(c => c[1] === 'archive' && c.includes(THREAD))).toBe(true)
-  expect(await ui.find({ key: `thread-${THREAD}` })).toBeUndefined()
-  expect(await shown(ui)).toContain('Archived “Plan the auth flow”')
-
-  await ui.press({ key: 'tab-archived' })
-  expect(await ui.find({ key: `restore-${THREAD}` })).toBeDefined()
-  await ui.press({ key: `restore-${THREAD}` })
-  expect(calls.some(c => c[1] === 'unarchive' && c.includes(THREAD))).toBe(true)
-  expect(await ui.find({ key: `restore-${THREAD}` })).toBeUndefined()
-  expect(await shown(ui)).toContain('Restored “Plan the auth flow”')
-  await ui.unmount()
-})
-
-test('Disconnect leaves the Codex chat tab on its start, and says the thread is not archived', async ($, on) => {
+test('/tandem close says the thread stays in the Codex app, not archived', async ($, on) => {
   const clock = engine(on)
   const calls = core(on, [])
   await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
   await $.tool.call({ tool: 'mcp__tandem__connect', thread: THREAD })
   await clock.advance(0)
 
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect(await ui.find({ key: 'close' })).toBeDefined()
-  await ui.press({ key: 'close' })
+  const text = await typed($, 'close')
   expect(calls.some(c => c[1] === 'close')).toBe(true)
-  const text = await shown(ui)
   expect(text).toContain('Disconnected from Review the settings screen')
   expect(text).toContain('not archived')
-  expect(text).toContain('Talk with Codex')
-  await ui.unmount()
 })
 
 test('the proposals stay in view after the pick: while they are applied, in the details, and on the merge card', async ($, on) => {
@@ -1517,7 +1357,7 @@ test('Stop watching holds, even while a status of the watched run is on its way'
   })
   await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await ui.press({ key: 'tab-run' })
+  await ui.press({ key: 'runs-load' })
   await ui.press({ key: 'watch-r-other' })
   hold = true
   await clock.advance(2000) // a status poll starts and waits
@@ -1538,7 +1378,7 @@ test("the orchestrator's tools leave a run this session only watches alone, and 
   })
   await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await ui.press({ key: 'tab-run' })
+  await ui.press({ key: 'runs-load' })
   await ui.press({ key: 'watch-r-other' })
   await ui.unmount()
   const reviewed = JSON.stringify(await $.tool.call({ tool: 'mcp__tandem__orch_review', task: 'a', verdict: 'approve' }))

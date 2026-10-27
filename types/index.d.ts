@@ -1,13 +1,3 @@
-export type ChatEntry = {
-  id: string
-  from: 'claude' | 'codex' | 'user' | 'notice'
-  numbers: number[]
-  text: string
-  at: number
-  // The conversation it belongs to: the panel shows only the open conversation's entries.
-  room?: string
-}
-
 export type RoomView = {
   name: string
   root: string
@@ -149,7 +139,6 @@ export type RunView = {
 
 // What the last action in a tab came to: shown at the top of that tab (`home` is from before the tabs: any tab).
 export type Flash = {
-  scope: 'home' | 'run' | 'chat' | 'archived'
   tone: 'done' | 'error'
   text: string
   at: number
@@ -179,31 +168,22 @@ declare module 'claude-code' {
   interface PluginState {
     tandem: {
       room: RoomView | null
-      entries: ChatEntry[]
       threads: ThreadRow[]
-      // the project's archived Codex threads, for the Archived tab
-      archived: ThreadRow[]
-      paused: boolean
-      held: string[]
       cwd: string
       run: RunView | null
       picks: Record<string, number[]>
-      // the open tab; auto: the run when there is one, else the connected thread, else the start of a run
-      // (home is from before the tabs and reads as auto)
-      view: 'auto' | 'home' | 'run' | 'chat' | 'archived'
       runs: RunRow[]
       observing: boolean
       // keys of the panel's actions in flight
       busy: string[]
       flash: Flash | null
-      loads: { threads: LoadState; runs: LoadState; archived?: LoadState }
+      loads: { threads: LoadState; runs: LoadState }
       starting: Starting | null
       // the key of a stop the person has to confirm
       confirm: string | null
-      // the parts the person opened: a task's details, a proposal's change, the whole goal, the older threads
+      // the parts the person opened: a task's details, a proposal's change, the whole goal
       expanded: string[]
       runTrouble: Trouble | null
-      chatTrouble: Trouble | null
       // the background agent that keeps the session marked as working while Codex works; its id comes with its first hold
       watcher: { id: string | null; holds: number } | null
       // whether Tandem notifies the person when a run waits for them (kept in the plugin's store between sessions)

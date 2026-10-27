@@ -2,7 +2,7 @@
 // The fake core keeps rooms like the real one: `open --join` takes an open room already bound to the thread, otherwise the
 // requested name; `open` always clears `closed`; `close` sets it.
 import { expect, mock, test } from 'claude-code/testing'
-import type { MockClock } from 'claude-code/testing'
+import type { Engine, MockClock } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 const ROW1 = '01a173c4-e425-7720-90d8-7a2d15cff563' // no name: a test thread whose first words are "Reply with exactly ..."
@@ -10,13 +10,6 @@ const ROW2 = '01a173c4-e43b-7581-84e4-bde112b7351b'
 const ROW3 = '01a17239-9c12-7862-9a35-4ae4c6377805' // Review the settings screen
 const NAMES: Record<string, string | null> = { [ROW1]: null, [ROW2]: null, [ROW3]: 'Review the settings screen' }
 const PREVIEW1 = 'Reply with exactly the words BG-OK and nothing else.'
-
-const PANE = {
-  plugin: 'tandem',
-  component: 'Pane',
-  requestId: 'tandem',
-  props: { title: 'Tandem', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} },
-} as const
 
 function ok(stdout: string) {
   return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -37,8 +30,13 @@ function engine(on: On) {
   return clock
 }
 
-async function shown(ui: { findAll: (query: { type: string }) => Promise<{ text: string }[]> }) {
-  return (await ui.findAll({ type: 'Text' })).map(found => found.text).join('\n')
+// The person types /tandem <args>.
+async function typed($: Engine, args: string): Promise<string> {
+  return (await $.command.run({ command: 'tandem', args, origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })).text ?? ''
+}
+
+async function notConnected($: Engine): Promise<boolean> {
+  return JSON.stringify(await $.tool.call({ tool: 'mcp__tandem__send', message: 'Are you there?' })).includes('No Codex thread is connected')
 }
 
 type Room = { thread: string; closed: boolean }
@@ -115,40 +113,28 @@ function gate() {
   return { promise, release: () => release() }
 }
 
-test('row 1, row 3, Disconnect, row 1 again: one conversation at a time, a clean screen, and the nameless thread by its words', async ($, on) => {
+test('row 1, row 3, Disconnect, row 1 again: one conversation at a time, and the nameless thread by its words', async ($, on) => {
   const clock = engine(on)
   const core = fakeCore(on)
   await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await ui.press({ key: 'tab-chat' })
-  await settle(clock)
 
-  await ui.press({ key: `thread-${ROW1}` })
+  await $.tool.call({ tool: 'mcp__tandem__connect', thread: ROW1 })
   await settle(clock)
   expect(core.rooms['thread-15cff563']).toEqual({ thread: ROW1, closed: false })
-  expect(await shown(ui)).toContain('Connected to “Reply with exactly the words BG-OK') // a press in the list
 
-  // With a conversation open the Codex chat tab shows the conversation, not the list: the next thread comes from Claude's tool.
-  expect(await ui.find({ key: `thread-${ROW3}` })).toBeUndefined()
   await $.tool.call({ tool: 'mcp__tandem__connect', thread: ROW3 })
   await settle(clock)
   expect(core.rooms['review-the-settings-screen-c6377805']).toEqual({ thread: ROW3, closed: false })
-  expect(core.rooms['thread-15cff563'].closed).toBe(true) // the room the panel left is not left open on disk
-  expect(await shown(ui)).toContain('Claude connected to Review the settings screen') // the conversation says who connected it
+  expect(core.rooms['thread-15cff563'].closed).toBe(true) // the room left behind is not left open on disk
 
-  await ui.press({ key: 'close' })
+  expect(await typed($, 'close')).toContain('Disconnected from Review the settings screen')
   await settle(clock)
   expect(core.rooms['review-the-settings-screen-c6377805'].closed).toBe(true)
-  const afterClose = await shown(ui)
-  expect(afterClose).toContain('Disconnected from Review the settings screen')
-  expect(afterClose).not.toContain('Talking with Codex')
+  expect(await notConnected($)).toBe(true)
 
-  await ui.press({ key: `thread-${ROW1}` })
-  await settle(clock)
-  const text = await shown(ui)
-  expect(text).not.toContain('Disconnected from') // the old message does not stand over the new conversation
-  expect(text).toContain('Reply with exactly the words BG-OK') // not "A Codex thread" / "Codex thread"
-  await ui.unmount()
+  // A thread Codex has not named is called by its first words, not "a Codex thread".
+  const again = JSON.stringify(await $.tool.call({ tool: 'mcp__tandem__connect', thread: '1' }))
+  expect(again).toContain('Reply with exactly the words BG-OK')
 })
 
 test('a poll still in flight when Disconnect runs does not bring the room back', async ($, on) => {
@@ -163,16 +149,14 @@ test('a poll still in flight when Disconnect runs does not bring the room back',
   await clock.advance(2000)
   await settle(clock)
   expect(hold.started).toBeGreaterThan(0)
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await ui.press({ key: 'close' })
+  await typed($, 'close')
   await settle(clock)
   release.release()
   await settle(clock, 8)
-  expect(await shown(ui)).not.toContain('Talking with Codex')
-  await ui.unmount()
+  expect(await notConnected($)).toBe(true)
 })
 
-test('a start_codex still running when Disconnect ran does not take the panel over, and Claude is told', async ($, on) => {
+test('a start_codex still running when Disconnect ran does not connect, and Claude is told', async ($, on) => {
   const clock = engine(on)
   const release = gate()
   const core = fakeCore(on, { hold: { verb: 'new-codex', gate: release.promise, armed: true, started: 0 } })
@@ -181,25 +165,20 @@ test('a start_codex still running when Disconnect ran does not take the panel ov
   await settle(clock)
   const starting = $.tool.call({ tool: 'mcp__tandem__start_codex', message: 'Review the plan' })
   await settle(clock)
-
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await ui.press({ key: 'close' })
+  await typed($, 'close')
   await settle(clock)
   release.release()
   const result = JSON.stringify(await starting)
   await settle(clock)
 
-  expect(result).toContain('pressed Disconnect')
+  expect(result).toContain('The user disconnected')
   expect(result).toContain('Do not connect again on your own')
-  const text = await shown(ui)
-  expect(text).not.toContain('Talking with Codex')
-  expect(text).not.toContain('New Codex thread')
+  expect(await notConnected($)).toBe(true)
   const call = core.calls.find(c => c[1] === 'new-codex') ?? []
   expect(core.rooms[call[call.indexOf('--room') + 1] ?? '']?.closed).toBe(true) // the room it opened is closed again
-  await ui.unmount()
 })
 
-test('a connect still opening when Disconnect ran does not take the panel over either', async ($, on) => {
+test('a connect still opening when Disconnect ran does not connect either', async ($, on) => {
   const clock = engine(on)
   const release = gate()
   const hold: Hold = { verb: 'open', gate: release.promise, armed: false, started: 0 }
@@ -211,15 +190,13 @@ test('a connect still opening when Disconnect ran does not take the panel over e
   const connecting = $.tool.call({ tool: 'mcp__tandem__connect', thread: ROW1 })
   await settle(clock)
   expect(hold.started).toBe(1)
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await ui.press({ key: 'close' })
+  await typed($, 'close')
   await settle(clock)
   release.release()
   const result = JSON.stringify(await connecting)
   await settle(clock)
-  expect(result).toContain('pressed Disconnect')
-  expect(await shown(ui)).not.toContain('Talking with Codex')
-  await ui.unmount()
+  expect(result).toContain('The user disconnected')
+  expect(await notConnected($)).toBe(true)
 })
 
 test('Disconnect lets go of the conversation even when the core cannot close its room, and says so', async ($, on) => {
@@ -228,13 +205,8 @@ test('Disconnect lets go of the conversation even when the core cannot close its
   await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
   await $.tool.call({ tool: 'mcp__tandem__connect', thread: ROW3 })
   await settle(clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await ui.press({ key: 'close' })
-  await settle(clock)
-  const text = await shown(ui)
-  expect(text).not.toContain('Talking with Codex')
-  expect(text).toContain('could not mark its room closed')
-  await ui.unmount()
+  expect(await typed($, 'close')).toContain('could not mark its room closed')
+  expect(await notConnected($)).toBe(true)
 })
 
 test('after the user disconnected, send tells Claude not to connect again on its own', async ($, on) => {
@@ -243,19 +215,21 @@ test('after the user disconnected, send tells Claude not to connect again on its
   await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
   await $.tool.call({ tool: 'mcp__tandem__connect', thread: ROW3 })
   await settle(clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await ui.press({ key: 'close' })
-  await settle(clock)
+  await typed($, 'close')
   const sent = JSON.stringify(await $.tool.call({ tool: 'mcp__tandem__send', message: 'Are you there?' }))
   expect(sent).toContain('Do not connect again on your own')
   expect(sent).not.toContain('Connect one first')
-  await ui.unmount()
 })
 
-test('a poll of the room the panel left never lands in the room it opened next', async ($, on) => {
+test('a poll of the room left behind never lands in the room opened next', async ($, on) => {
   const clock = engine(on)
   const release = gate()
   const hold: Hold = { verb: 'poll', gate: release.promise, armed: false, started: 0 }
+  const delivered: string[] = []
+  on('prompt.submit', (_, e) => {
+    delivered.push(e.text)
+    return { value: undefined }
+  })
   fakeCore(on, { hold })
   await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
   await $.tool.call({ tool: 'mcp__tandem__connect', thread: ROW3 })
@@ -269,13 +243,8 @@ test('a poll of the room the panel left never lands in the room it opened next',
   await settle(clock)
   release.release()
   await settle(clock, 8)
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  const text = await shown(ui)
-  expect(text).toContain('Talking with Codex')
-  expect(text).not.toContain('This conversation has ended')
-  expect(text).not.toContain('An answer from')
-  await ui.unmount()
-  expect(JSON.stringify(await $.tool.call({ tool: 'mcp__tandem__send', message: 'Still there?' }))).not.toContain('No Codex thread')
+  expect(delivered.some(text => text.includes('An answer from'))).toBe(false)
+  expect(await notConnected($)).toBe(false) // ROW1's conversation is still open
 })
 
 test('two nameless threads started close together get rooms of their own', async ($, on) => {
@@ -290,17 +259,12 @@ test('two nameless threads started close together get rooms of their own', async
   expect(new Set(rooms).size).toBe(2)
 })
 
-test("a number names the thread in the list Claude was shown, even after the panel's list changed", async ($, on) => {
-  const clock = engine(on)
-  const core = fakeCore(on, { reorder: true })
+test('a number names the thread in the list Claude was shown', async ($, on) => {
+  engine(on)
+  const core = fakeCore(on)
   await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
   const listed = JSON.stringify(await $.tool.call({ tool: 'mcp__tandem__threads' }))
   expect(listed).toContain('1. “Reply with exactly')
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await ui.press({ key: 'tab-chat' })
-  await ui.press({ key: 'threads-refresh' }) // the list comes back in another order
-  await settle(clock)
-  await ui.unmount()
   await $.tool.call({ tool: 'mcp__tandem__connect', thread: '1' })
   const open = core.calls.filter(call => call[1] === 'open').pop() ?? []
   expect(open[open.indexOf('--codex-thread') + 1]).toBe(ROW1)
@@ -312,9 +276,6 @@ test('Disconnect lets go even when the core cannot start at all', async ($, on) 
   await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
   await $.tool.call({ tool: 'mcp__tandem__connect', thread: ROW3 })
   await settle(clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await ui.press({ key: 'close' })
-  await settle(clock)
-  expect(await shown(ui)).not.toContain('Talking with Codex')
-  await ui.unmount()
+  await typed($, 'close')
+  expect(await notConnected($)).toBe(true)
 })
