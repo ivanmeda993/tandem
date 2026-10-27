@@ -32,7 +32,7 @@ When the user asks you to orchestrate a goal (plan it, split it into tasks for o
 7. **Claude roles.** Do tasks whose role runs on Claude (browser-tester, writer) yourself if your tools allow it, or ask the user to run them in a Claude session, then run `orch done`.
 8. **Notes.** Keep the run's notes with `scripts/tandem orch note --run <run> --text "…"`, a sentence or two each: what the user tells you in this thread that matters for the run, why you send a task back, what you learn about the codebase that later tasks need. When your context was compacted or you lost track, `scripts/tandem orch journal --run <run>` prints the run's state, latest events and your notes. Cleaning up a finished run removes the notes.
 
-`scripts/tandem orch status --run <run>` shows the run at any time, `orch stop --run <run>` stops it, and `orch watch --run <run>` restarts the conductor if updates stop. When everything is merged, summarize the run; the user merges `tandem/<run>` into their branch themselves. Tandem's commands start other Codex sessions: if your sandbox blocks them, ask the user to let them run outside it.
+`scripts/tandem orch status --run <run>` shows the run at any time, `orch stop --run <run>` stops it, and `orch watch --run <run>` restarts the conductor if updates stop. When everything is merged, summarize the run; the user merges the run's branch `tandem/<name>/result` into theirs themselves. Tandem's commands start other Codex sessions: if your sandbox blocks them, ask the user to let them run outside it.
 
 ## Working as a worker in an orchestrated run
 

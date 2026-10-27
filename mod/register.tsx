@@ -746,7 +746,7 @@ async function orchestratorGuide($: Engine): Promise<string> {
     "merge conflict comes back to you to have its worker resolve; with it off, approved tasks wait for the user's Merge " +
     'click. You never merge.\n' +
     '3. Tasks whose role runs on Claude are yours: do them in this session, a linked session or a subagent, then call orch_done.\n' +
-    "4. When every task is merged, the work is on the run's branch (tandem/<run>). Summarize the run for the user; they merge " +
+    "4. When every task is merged, the work is on the run's branch (tandem/<name>/result, <name> from the goal). Summarize the run for the user; they merge " +
     'that branch into theirs themselves.\n' +
     '5. Keep the run\'s notes with orch_note, a sentence or two each: what the user tells you in the chat that matters for the ' +
     'run, why you send a task back, and what you learn about the codebase that later tasks need. Leave out what Tandem shows ' +
@@ -2596,7 +2596,7 @@ function planCard(c: RunCtx, $: Engine): JSX.Element {
         {proposed.some(task => task.vendor === 'codex') ? (
           <Text size="footnote" dimColor>
             Approve plan starts Codex workers on the tasks that are ready, each on its own branch{' '}
-            <Text mono>{`${r.branch}-<task>`}</Text>
+            <Text mono>{r.task_branch}</Text>
             {where}. Nothing reaches your branch: {c.lead} reviews every change, and each one comes back here for you
             to merge.
           </Text>
@@ -3279,7 +3279,7 @@ function mergedCount(r: RunView): number {
 function howRunWorks(els: Els, r: RunView, lead: 'Claude' | 'Codex'): JSX.Element {
   const { Box, Text } = els
   const steps = [
-    `A Codex worker builds each task on its own git branch (${r.branch}-<task>) in its own folder; you can watch it in the Codex app.`,
+    `A Codex worker builds each task on its own git branch (${r.task_branch}) in its own folder; you can watch it in the Codex app.`,
     `${lead} reviews each change when its worker reports, and sends it back with notes until it holds.`,
     ...(r.simplify ? ['A simplifier then proposes simplifications, and you pick the ones the worker applies.'] : []),
     `${r.auto_merge ? 'Tandem merges' : 'You merge'} each approved task into the run's branch ${r.branch}. A task that depends on others starts once they are merged, from that branch.`,

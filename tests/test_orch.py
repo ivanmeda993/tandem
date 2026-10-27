@@ -60,6 +60,15 @@ class OrchHelpers:
     def git(self, *args):
         return subprocess.run(["git", "-C", self.repo, *args], capture_output=True, text=True, env=self.env).stdout.strip()
 
+    def branch(self, run, task_id=None):
+        """The run's branch, where merged work collects, or a task's own branch."""
+        data = self.run_json(run)
+        return data["integration"]["branch"] if task_id is None else next(t["branch"] for t in data["tasks"] if t["id"] == task_id)
+
+    def worktree(self, run, place):
+        """A task's worktree, or the run's own ("result"), named like its branch."""
+        return os.path.join(self.repo, ".tandem", "worktrees", self.run_json(run)["name"], place)
+
     def run_json(self, run):
         with open(os.path.join(self.repo, ".tandem", "runs", run, "run.json")) as f:
             return json.load(f)
@@ -115,9 +124,9 @@ class OrchTests(OrchHelpers, Base):
         turn = next(c["params"] for c in calls if c.get("method") == "turn/start")
         self.assertEqual(turn["effort"], "high")
         self.assertNotIn("cwd", turn)  # a turn's own folder would move the thread out of the project in the Codex app
-        self.assertIn(f"Your working folder is {os.path.join(self.repo, '.tandem', 'worktrees', f'{run}-a')}", turn["input"][0]["text"])
+        self.assertIn(f"Your working folder is {self.worktree(run, 'a')}", turn["input"][0]["text"])
         branch = next(c["params"]["gitInfo"]["branch"] for c in calls if c.get("method") == "thread/metadata/update")
-        self.assertEqual(branch, f"tandem/{run}-a")
+        self.assertEqual(branch, self.branch(run, "a"))
         self.assertEqual(next(c["params"]["name"] for c in calls if c.get("method") == "thread/name/set"), "repo · Task a")
 
         self.assertEqual(self.status(self.act("review", run, "--task", "a", "--verdict", "approve")["run"], "a"), "approved")
@@ -127,15 +136,16 @@ class OrchTests(OrchHelpers, Base):
         self.act("merge", run, "--task", "b")
         view, events = self.poll_until(run, lambda v, e: any(x["type"] == "done" for x in e))
         self.assertEqual(view["status"], "done")
-        self.assertEqual(self.git("show", f"tandem/{run}:a.txt"), "hello from a")
-        self.assertEqual(self.git("show", f"tandem/{run}:b.txt"), "hello from b")
-        self.assertIn("Tandem-Task: a", self.git("log", "--format=%B", f"tandem/{run}"))
+        self.assertEqual(self.git("show", f"{self.branch(run)}:a.txt"), "hello from a")
+        self.assertEqual(self.git("show", f"{self.branch(run)}:b.txt"), "hello from b")
+        self.assertIn("Tandem-Task: a", self.git("log", "--format=%B", self.branch(run)))
         self.assertEqual(view["codex_quota"], 12)
 
         cleaned = self.act("cleanup", run)
         self.assertIn("integration", cleaned["text"])
-        self.assertFalse(os.path.exists(os.path.join(self.repo, ".tandem", "worktrees", f"{run}-a")))
-        self.assertEqual(self.git("branch", "--list", f"tandem/{run}"), f"tandem/{run}")
+        self.assertFalse(os.path.exists(self.worktree(run, "a")))
+        self.assertFalse(os.path.exists(os.path.dirname(self.worktree(run, "a"))))  # the run's folder of worktrees too
+        self.assertEqual(self.git("branch", "--list", self.branch(run)), self.branch(run))
         with open(os.path.join(self.tmp, "archived.txt")) as f:  # the workers' threads leave the Codex app's list
             self.assertEqual(sorted(f.read().split()), sorted(t["thread"] for t in view["tasks"]))
 
@@ -188,7 +198,7 @@ class OrchTests(OrchHelpers, Base):
         journal = self.orch("journal", "--run", run).stdout
         self.assertIn(f"Run {run} in {self.repo}: running", journal)
         self.assertIn("Goal: Say hello", journal)
-        self.assertIn(f"Branch: tandem/{run}, where merged work collects: 0 of 2 tasks finished.", journal)
+        self.assertIn(f"Branch: {self.branch(run)}, where merged work collects: 0 of 2 tasks finished.", journal)
         self.assertIn("- b · Task b · implementer · waits for a", journal)
         self.assertIn("approve:", journal)  # the run's latest events
         self.assertRegex(journal, r"- \d{4}-\d\d-\d\d \d\d:\d\d · The user wants the tokens in src/theme\.")
@@ -212,11 +222,11 @@ class OrchTests(OrchHelpers, Base):
         diff = self.orch("diff", "--run", run, "--task", "a").stdout
         self.assertIn("a.txt", diff)
         self.assertNotIn("stale.pyc", diff)
-        worktree = os.path.join(self.repo, ".tandem", "worktrees", f"{run}-a")
+        worktree = self.worktree(run, "a")
         staged = subprocess.run(["git", "-C", worktree, "diff", "--cached", "--name-only"], capture_output=True, text=True)
         self.assertEqual(staged.stdout.strip(), "")
         self.act("merge", run, "--task", "a")
-        self.assertEqual(self.git("ls-tree", "--name-only", f"tandem/{run}").split(), ["README.md", "a.txt"])
+        self.assertEqual(self.git("ls-tree", "--name-only", self.branch(run)).split(), ["README.md", "a.txt"])
 
     def test_changes_then_blocked_then_accepted(self):
         run = self.start(fix_rounds=1)
@@ -240,13 +250,13 @@ class OrchTests(OrchHelpers, Base):
         self.act("approve", run)
         self.poll_until(run, lambda v, e: self.status(v, "a") == "reported")
         approved = self.act("review", run, "--task", "a", "--verdict", "approve")
-        self.assertIn(f"Merged a into tandem/{run}", approved["text"])
+        self.assertIn(f"Merged a into {self.branch(run)}", approved["text"])
         self.assertEqual(self.status(approved["run"], "a"), "merged")
         self.assertEqual(self.status(approved["run"], "b"), "running")  # what waited for a starts at once
         self.poll_until(run, lambda v, e: self.status(v, "b") == "reported")
         self.act("review", run, "--task", "b", "--verdict", "approve")
         view, events = self.poll_until(run, lambda v, e: any(x["type"] == "done" for x in e))
-        self.assertEqual(self.git("show", f"tandem/{run}:b.txt"), "hello from b")
+        self.assertEqual(self.git("show", f"{self.branch(run)}:b.txt"), "hello from b")
         self.assertEqual([t.get("merged_by") for t in self.run_json(run)["tasks"]], ["tandem", "tandem"])
 
     def test_auto_merge_after_the_simplifier_and_on_a_conflict(self):
@@ -265,14 +275,14 @@ class OrchTests(OrchHelpers, Base):
         self.act("review", run, "--task", "b", "--verdict", "changes", "--notes", "WRITE same.txt resolved")
         self.poll_until(run, lambda v, e: self.status(v, "b") == "reported")
         self.assertIn("Merged b", self.act("review", run, "--task", "b", "--verdict", "approve")["text"])
-        self.assertEqual(self.git("show", f"tandem/{run}:same.txt"), "resolved")
+        self.assertEqual(self.git("show", f"{self.branch(run)}:same.txt"), "resolved")
 
     def test_a_task_tandem_could_not_merge_waits_for_the_user(self):
         run = self.start(auto_merge=True)
         self.plan(run, [task("a")])
         self.act("approve", run)
         self.poll_until(run, lambda v, e: self.status(v, "a") == "reported")
-        integration = os.path.join(self.repo, ".tandem", "worktrees", f"{run}-integration")
+        integration = self.worktree(run, "result")
         with open(os.path.join(integration, "a.txt"), "w") as f:  # an untracked file the merge would overwrite
             f.write("local\n")
         approved = self.act("review", run, "--task", "a", "--verdict", "approve")
@@ -284,6 +294,33 @@ class OrchTests(OrchHelpers, Base):
         os.remove(os.path.join(integration, "a.txt"))
         self.assertIn("Merged a", self.act("merge", run, "--task", "a")["text"])
         self.assertEqual(self.run_json(run)["tasks"][0]["merged_by"], "user")
+
+    def test_branches_and_worktrees_are_named_for_the_goal(self):
+        goal = "Dodaj tamnu temu: boje, ikonice i đački režim"
+        started = json.loads(self.orch("init", "--goal", goal, "--setup", json.dumps({"simplify": False})).stdout)
+        run = started["run"]["id"]
+        self.assertEqual(started["run"]["branch"], "tandem/dodaj-tamnu-temu-boje-ikonice-i-djacki/result")
+        self.assertEqual(started["run"]["task_branch"], "tandem/dodaj-tamnu-temu-boje-ikonice-i-djacki/<task>")
+        self.assertIn("Workers branch off tandem/dodaj-tamnu-temu-boje-ikonice-i-djacki/result", started["text"])
+        self.assertIn("task id 'result'", self.plan(run, [task("result")], ok=False).stderr)
+        self.plan(run, [task("a")])
+        self.act("approve", run)
+        self.assertEqual(self.branch(run, "a"), "tandem/dodaj-tamnu-temu-boje-ikonice-i-djacki/a")
+        self.assertTrue(os.path.isdir(self.worktree(run, "a")))
+        # The same goal again gets a name of its own.
+        again = json.loads(self.orch("init", "--goal", goal, "--setup", "{}").stdout)["run"]
+        self.assertEqual(again["branch"], "tandem/dodaj-tamnu-temu-boje-ikonice-i-djacki-2/result")
+
+    def test_a_run_from_before_names_keeps_its_branches(self):
+        run = self.start()
+        data = self.run_json(run)
+        del data["name"]  # how runs started before branches were named for their goal look
+        with open(os.path.join(self.repo, ".tandem", "runs", run, "run.json"), "w") as f:
+            json.dump(data, f)
+        self.plan(run, [task("a")])
+        self.act("approve", run)
+        self.assertEqual(self.branch(run, "a"), f"tandem/{run}-a")
+        self.assertTrue(os.path.isdir(os.path.join(self.repo, ".tandem", "worktrees", f"{run}-a")))
 
     def test_merge_conflict_goes_back_to_the_worker(self):
         run = self.start(fix_rounds=0)  # resolving a conflict Tandem's merge caused uses no fix round
@@ -302,7 +339,7 @@ class OrchTests(OrchHelpers, Base):
         self.poll_until(run, lambda v, e: self.status(v, "b") == "reported")
         self.act("review", run, "--task", "b", "--verdict", "approve")
         self.assertIn("Merged b", self.act("merge", run, "--task", "b")["text"])
-        self.assertEqual(self.git("show", f"tandem/{run}:same.txt"), "resolved")
+        self.assertEqual(self.git("show", f"{self.branch(run)}:same.txt"), "resolved")
 
     def test_conflict_fix_after_skipped_proposals_goes_to_the_builder(self):
         run = self.start(simplify=True)
@@ -337,7 +374,7 @@ class OrchTests(OrchHelpers, Base):
         for task_id in ("a", "b"):
             self.act("review", run, "--task", task_id, "--verdict", "approve")
         self.assertIn("Merged a", self.act("merge", run, "--task", "a")["text"])
-        integration = os.path.join(self.repo, ".tandem", "worktrees", f"{run}-integration")
+        integration = self.worktree(run, "result")
         with open(os.path.join(integration, "b.txt"), "w") as f:  # an untracked file the merge would overwrite
             f.write("local\n")
         refused = self.act("merge", run, "--task", "b", ok=False)
@@ -414,7 +451,7 @@ class OrchTests(OrchHelpers, Base):
         self.assertEqual(self.status(stopped["run"], "a"), "stopping")
         self.assertIn("Still running in the Codex app: Task a", stopped["text"])
         self.assertEqual(self.status(self.act("cleanup", run)["run"], "a"), "stopping")
-        self.assertTrue(os.path.isdir(os.path.join(self.repo, ".tandem", "worktrees", f"{run}-a")))
+        self.assertTrue(os.path.isdir(self.worktree(run, "a")))
         view, _ = self.poll_until(run, lambda v, e: self.status(v, "a") == "cancelled", timeout=20)  # the app closed
 
     def test_cancel_stops_a_running_worker(self):
@@ -495,7 +532,7 @@ class OrchTests(OrchHelpers, Base):
         self.act("approve", run)
         self.poll_until(run, lambda v, e: self.status(v, "a") == "reported")
         start = next(c["params"] for c in self.server_calls() if c.get("method") == "thread/start")
-        self.assertEqual((start["sandbox"], start["cwd"]), ("workspace-write", os.path.join(self.repo, ".tandem", "worktrees", f"{run}-a")))
+        self.assertEqual((start["sandbox"], start["cwd"]), ("workspace-write", self.worktree(run, "a")))
         self.assertNotIn("cwd", next(c["params"] for c in self.server_calls() if c.get("method") == "turn/start"))
 
     def test_parallel_limit_and_overlap(self):
@@ -623,13 +660,13 @@ class OrchTests(OrchHelpers, Base):
         self.act("review", run, "--task", "a", "--verdict", "approve")
         self.poll_until(run, lambda v, e: self.status(v, "a") == "proposals")
         self.act("cleanup", run)
-        self.assertTrue(os.path.isdir(os.path.join(self.repo, ".tandem", "worktrees", f"{run}-a")))
+        self.assertTrue(os.path.isdir(self.worktree(run, "a")))
         self.act("apply", run, "--task", "a", "--items", "2")
         self.poll_until(run, lambda v, e: self.status(v, "a") == "reported")
 
     def test_a_task_whose_worker_never_started(self):
         run = self.start()
-        self.git("branch", f"tandem/{run}-a")  # git worktree add then fails
+        self.git("branch", f"tandem/{self.run_json(run)['name']}/a")  # git worktree add then fails
         self.plan(run, [task("a")])
         self.assertEqual(self.status(self.act("approve", run)["run"], "a"), "failed")
         refused = self.orch("send", "--run", run, "--task", "a", "--message", "try again", ok=False)
@@ -647,17 +684,17 @@ class OrchTests(OrchHelpers, Base):
         self.plan(run, [task("a")])
         self.act("approve", run)
         self.poll_until(run, lambda v, e: self.status(v, "a") == "reported")
-        self.assertTrue(os.path.exists(os.path.join(self.repo, ".tandem", "worktrees", f"{run}-a", ".env.local")))
+        self.assertTrue(os.path.exists(os.path.join(self.worktree(run, "a"), ".env.local")))
         self.act("review", run, "--task", "a", "--verdict", "approve")
         self.act("merge", run, "--task", "a")
-        self.assertNotIn(".env.local", self.git("ls-tree", "--name-only", f"tandem/{run}").split())
+        self.assertNotIn(".env.local", self.git("ls-tree", "--name-only", self.branch(run)).split())
 
     def test_files_in_other_encodings_do_not_break_diff_or_merge(self):
         run = self.start()
         self.plan(run, [task("a")])
         self.act("approve", run)
         self.poll_until(run, lambda v, e: self.status(v, "a") == "reported")
-        with open(os.path.join(self.repo, ".tandem", "worktrees", f"{run}-a", "legacy.txt"), "wb") as f:
+        with open(os.path.join(self.worktree(run, "a"), "legacy.txt"), "wb") as f:
             f.write("Ime: Đurađ \n".encode("cp1250"))  # Windows-1250, with trailing whitespace
         self.assertIn("legacy.txt", self.orch("diff", "--run", run, "--task", "a").stdout)
         self.act("review", run, "--task", "a", "--verdict", "approve")
@@ -675,7 +712,7 @@ class OrchTests(OrchHelpers, Base):
                                             capture_output=True, text=True).stdout)
         self.assertEqual(self.run_json(started["run"]["id"])["base"], head)
         self.assertIn("from feature", started["text"])
-        self.assertEqual(self.git("show", f"tandem/{started['run']['id']}:feature.txt"), "feature work")
+        self.assertEqual(self.git("show", f"{started['run']['branch']}:feature.txt"), "feature work")
 
     def test_budget_pauses_and_more_resumes(self):
         run = self.start(budget=1, workers={"max_parallel": 2})
@@ -713,8 +750,8 @@ class OrchTests(OrchHelpers, Base):
         self.assertEqual(stopped["run"]["status"], "stopped")
         self.assertEqual({t["status"] for t in stopped["run"]["tasks"]}, {"cancelled"})
         cleaned = self.act("cleanup", run)
-        self.assertIn(f"tandem/{run}-a", cleaned["text"])
-        self.assertEqual(self.git("show", f"tandem/{run}-a:a.txt"), "hello from a")
+        self.assertIn(self.branch(run, "a"), cleaned["text"])
+        self.assertEqual(self.git("show", f"{self.branch(run, 'a')}:a.txt"), "hello from a")
 
     def test_workers_cannot_orchestrate(self):
         self.env["TANDEM_SPAWNED"] = "1"

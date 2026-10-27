@@ -127,6 +127,8 @@ export type RunView = {
   paused: string | null
   needs_approval: boolean
   branch: string
+  // Each task's own branch, as a pattern: tandem/<run name>/<task> (older runs: <branch>-<task>)
+  task_branch: string
   budget: { used: number; limit: number }
   // where: in the Codex app, which opens each worker's thread, or in the background
   workers: { model: string | null; effort: string; max_parallel: number; access: string; where: 'app' | 'background' }

@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -31,6 +32,10 @@ import tandem_core as core
 ROLES_PATH = os.path.join(os.path.dirname(core.HERE), "roles.json")
 RUN_ID_RE = re.compile(r"r-[a-z0-9]{3,12}")
 TASK_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,23}")
+# A run's branches are named for its goal: tandem/<name>/result collects the merged work, the branch the user merges
+# into theirs, and tandem/<name>/<task> is each task's own. Their worktrees are .tandem/worktrees/<name>/... alike.
+RESULT = "result"
+NAME_CHARS = 40
 DIGEST_WAIT_SECONDS = 180
 UPDATE_RETRY_SECONDS = 60
 UPDATE_TRIES = 10
@@ -228,8 +233,9 @@ def validate_tasks(new, kept, catalog):
         if not isinstance(raw, dict):
             core.fail("each task is an object")
         task_id = str(raw.get("id", ""))
-        if not TASK_ID_RE.fullmatch(task_id) or task_id in ids:
-            core.fail(f"task id {task_id!r}: use a new id of lowercase letters, digits and '-' (at most 24)")
+        if not TASK_ID_RE.fullmatch(task_id) or task_id in ids or task_id == RESULT:
+            core.fail(f"task id {task_id!r}: use a new id of lowercase letters, digits and '-' (at most 24), "
+                      f"other than {RESULT}, which names the run's own branch")
         ids.add(task_id)
         role = raw.get("role")
         if role not in catalog:
@@ -378,13 +384,15 @@ def start_worker(root, run, task):
     workers = run["setup"]["workers"]
     sandbox, network = access_for(run, role)
     name = f"{run['id']}-{task['id']}"
+    # Runs from before branches were named for their goal name the task's branch and worktree like its room.
+    place = f"{run['name']}/{task['id']}" if run.get("name") else name
     room = core.Room(SimpleNamespace(room=name, cd=root))
-    worktree = os.path.join(root, ".tandem", "worktrees", name)
+    worktree = os.path.join(root, ".tandem", "worktrees", place)
     if os.path.isdir(worktree):
         base = git(worktree, "rev-parse", "HEAD")  # workers never commit, so this is still where it started
     else:
         base = git(run["integration"]["worktree"], "rev-parse", "HEAD")
-        worktree = core.add_worktree(root, room.git_dir, name, f"tandem/{name}", base)
+        worktree = core.add_worktree(root, room.git_dir, place, f"tandem/{place}", base)
         copy_files(root, worktree, run["setup"]["copy"])
     config = {"features.multi_agent": False}  # workers do not start Codex subagents
     if network and sandbox == "workspace-write":
@@ -396,7 +404,7 @@ def start_worker(root, run, task):
                 in_app=workers.get("where", "background") == "app" and sandbox == "danger-full-access",
                 **placement(root, worktree, sandbox))
     core.write_json(room.meta_path, meta)
-    task.update(room=name, worktree=worktree, branch=f"tandem/{name}", base=base,
+    task.update(room=name, worktree=worktree, branch=f"tandem/{place}", base=base,
                 model=workers["model"], effort=workers["effort"], sandbox=sandbox)
     started = started_turn(room)
     if started:
@@ -1013,7 +1021,9 @@ def view(root, run):
     workers = run["setup"]["workers"]
     return {"id": run["id"], "root": root, "goal": run["goal"], "status": run["status"], "paused": run.get("paused") or None,
             "needs_approval": any(task["status"] == "proposed" for task in run["tasks"]),
-            "branch": run["integration"]["branch"], "budget": {"used": run["setup"]["budget"] - budget_left(run),
+            "branch": run["integration"]["branch"],
+            "task_branch": f"tandem/{run['name']}/<task>" if run.get("name") else f"{run['integration']['branch']}-<task>",
+            "budget": {"used": run["setup"]["budget"] - budget_left(run),
                                                                "limit": run["setup"]["budget"]},
             "workers": {"model": workers["model"], "effort": workers["effort"], "max_parallel": workers["max_parallel"],
                         "access": workers["access"], "where": workers.get("where", "background")},
@@ -1066,6 +1076,7 @@ def cmd_init(args, root):
     goal = args.goal.strip()
     if not goal:
         core.fail("say what the run should achieve")
+    name = run_name(root, goal)
     stamp = int(time.time() * 1000)
     run_id = "r-" + core_base36(stamp)[-6:]
     while os.path.exists(run_path(root, run_id)):
@@ -1074,7 +1085,7 @@ def cmd_init(args, root):
     os.makedirs(os.path.dirname(run_path(root, run_id)))
     core.ensure_git_excluded(git_dir)
     try:
-        integration = core.add_worktree(root, git_dir, f"{run_id}-integration", f"tandem/{run_id}", base)
+        integration = core.add_worktree(root, git_dir, f"{name}/{RESULT}", f"tandem/{name}/{RESULT}", base)
     except RuntimeError as error:
         core.fail(str(error), 5)
     branch = run_git(here, "branch", "--show-current").stdout.strip() or None
@@ -1085,9 +1096,9 @@ def cmd_init(args, root):
         room = core.Room(SimpleNamespace(room=f"{run_id}.orchestrator", cd=root))
         core.open_room(room, thread)
         orchestrator = {"vendor": "codex", "thread": thread, "room": room.name}
-    run = {"id": run_id, "goal": goal, "owner": args.owner, "orchestrator": orchestrator, "created_at": core.now(),
+    run = {"id": run_id, "name": name, "goal": goal, "owner": args.owner, "orchestrator": orchestrator, "created_at": core.now(),
            "status": "planning", "setup": setup, "base": base,
-           "base_branch": branch, "integration": {"branch": f"tandem/{run_id}", "worktree": integration},
+           "base_branch": branch, "integration": {"branch": f"tandem/{name}/{RESULT}", "worktree": integration},
            "tasks": [], "counters": {"dispatches": 0, "fixes": 0, "messages": 0}, "paused": None,
            "digest": {"tasks": [], "since": None}}
     core.write_json(run_path(root, run_id), run)
@@ -1095,8 +1106,8 @@ def cmd_init(args, root):
     start_conductor(root, run)
     log_event(root, run, "init", goal)
     dirty = [line for line in run_git(here, "status", "--porcelain").stdout.splitlines() if line.strip()]
-    text = (f"Started run {run_id} from {branch or base[:12]}. Workers branch off tandem/{run_id}, which starts at "
-            f"your current commit {base[:12]}.")
+    text = (f"Started run {run_id} from {branch or base[:12]}. Workers branch off tandem/{name}/{RESULT}, which starts at "
+            f"your current commit {base[:12]} and collects the merged work.")
     if by_codex(run):
         text += (" You orchestrate it from this thread: Tandem's conductor sends you updates here, so end your turns "
                  "instead of waiting or polling. Submit the plan with " + command(root, f"plan --run {run_id}")
@@ -1105,6 +1116,28 @@ def cmd_init(args, root):
         text += (f" Note: {len(dirty)} uncommitted change(s) in your checkout are not part of it; commit them first "
                  "if the workers need them.")
     emit({"ok": True, "text": text, "run": view(root, run)})
+
+
+def run_name(root, goal):
+    """The name of a run's branches and worktrees: the goal's first words, in ASCII. A name that a branch or a folder
+    already uses gets a number."""
+    text = unicodedata.normalize("NFKD", goal.replace("đ", "dj").replace("Đ", "Dj"))
+    words = re.findall(r"[a-z0-9]+", text.encode("ascii", "ignore").decode().lower())
+    name = words[0][:NAME_CHARS] if words else "run"
+    for word in words[1:]:
+        if len(name) + 1 + len(word) > NAME_CHARS:
+            break
+        name += "-" + word
+
+    def taken(candidate):  # the pattern matches the branch itself and every branch under it
+        return bool(run_git(root, "for-each-ref", "--format=%(refname)", f"refs/heads/tandem/{candidate}").stdout.strip()
+                    or os.path.exists(os.path.join(root, ".tandem", "worktrees", candidate)))
+
+    candidate, number = name, 1
+    while taken(candidate):
+        number += 1
+        candidate = f"{name}-{number}"
+    return candidate
 
 
 def core_base36(number):
@@ -1670,6 +1703,9 @@ def cmd_cleanup(args, root):
             run_git(root, "worktree", "remove", "--force", integration)
             removed.append("integration")
         run_git(root, "worktree", "prune")
+        if run.get("name"):  # the run's folder of worktrees, once it holds none
+            with contextlib.suppress(OSError):
+                os.rmdir(os.path.join(root, ".tandem", "worktrees", run["name"]))
         if run["status"] in ("done", "stopped"):
             run["cleaned_at"] = core.now()
             # The orchestrator's notes were for the run while it lasted; the run's own state and events stay.

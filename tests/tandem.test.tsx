@@ -315,6 +315,7 @@ const RUN = {
   paused: null,
   needs_approval: false,
   branch: 'tandem/r-test1',
+  task_branch: 'tandem/r-test1-<task>',
   budget: { used: 0, limit: 40 },
   workers: { model: null, effort: 'high', max_parallel: 2, access: 'worktree', where: 'app' },
   simplify: true,
