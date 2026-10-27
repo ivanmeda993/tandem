@@ -2342,11 +2342,10 @@ function hot(key: string): string | undefined {
   return drawingOn === 'mobile' ? undefined : key
 }
 
-// A button's label with its key: a desktop draws a native button that shows none, while the terminal shows a plain
-// button's key before its label by itself.
+// A button's label with its key. A desktop draws a button's key beside it, and the terminal a plain button's before
+// it (`1: label`), so only the terminal's framed button carries its key in its label.
 function keyed(label: string, key: string | undefined, plain = false): string {
-  if (!key || (plain && drawingOn === 'terminal')) return label
-  return plain ? `${key} ${label}` : `${label} · ${key}`
+  return key && !plain && drawingOn === 'terminal' ? `${label} · ${key}` : label
 }
 
 function decideOn($: Engine, decision: Decision): () => void {
@@ -2923,6 +2922,11 @@ function picksCard(c: RunCtx, $: Engine, task: TaskView): JSX.Element {
       </Box>
       {!c.answerInCodex && (
         <Box flexDirection="row" flexWrap="wrap" gap={1} alignItems="center">
+          {mine.length === 0 && (
+            <Text size="footnote" dimColor>
+              Tick a suggestion to have the worker apply it.
+            </Text>
+          )}
           {mine.length > 0 && (
             <Button
               key={`apply-${task.id}`}

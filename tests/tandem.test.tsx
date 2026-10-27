@@ -636,7 +636,7 @@ test('the plan card says what Approve plan does and shows the tasks in the order
     const approve = await ui.find({ key: 'approve-plan' })
     expect(approve?.props.autoFocus).toBe(true)
     expect(approve?.props.hotkey).toBe(surface === 'mobile' ? undefined : 'a')
-    expect(approve?.props.label).toBe(surface === 'mobile' ? 'Approve plan' : 'Approve plan · a')
+    expect(approve?.props.label).toBe(surface === 'terminal' ? 'Approve plan · a' : 'Approve plan')
     await ui.unmount()
   }
 })
@@ -855,8 +855,11 @@ test('the user picks which simplifier proposals the worker applies', async ($, o
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await ui.find({ type: 'Text', text: /Simplify “Theme tokens”\?/ })).toBeDefined()
   expect(await ui.find({ key: 'apply-a' })).toBeUndefined()
+  // With nothing ticked, the card says how a suggestion is applied.
+  expect(await ui.find({ type: 'Text', text: /Tick a suggestion to have the worker apply it/ })).toBeDefined()
   await ui.press({ key: 'pick-a-2' })
   await clock.advance(0)
+  expect(await ui.find({ type: 'Text', text: /Tick a suggestion/ })).toBeUndefined()
   await ui.press({ key: 'apply-a' })
   await clock.advance(0)
   await ui.unmount()
@@ -1067,7 +1070,7 @@ test('a worker with no new step for 8 minutes is flagged in the panel and the ba
   const text = await shown(ui)
   expect(text).toContain('⚠ No new step for 9 min.')
   expect(text).toContain('It may be waiting for your approval in the Codex app.')
-  expect((await ui.find({ key: 'codex-a' }))?.props.label).toBe('Open in Codex · o')
+  expect((await ui.find({ key: 'codex-a' }))?.props.label).toBe('Open in Codex') // the desktop draws its key, o, beside it
   await ui.unmount()
   const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
   expect(await shown(band)).toContain('“Theme tokens”: no new step for 9 min')
@@ -1116,10 +1119,11 @@ test('the main decisions have keys, shown on the buttons, and the first one take
       expect(merge?.props.label).toBe('Merge')
     } else {
       expect([merge?.props.hotkey, pick?.props.hotkey, keep?.props.hotkey]).toEqual(['m', '1', 'k'])
-      expect(merge?.props.label).toBe('Merge · m')
-      expect(keep?.props.label).toBe('Keep as is · k')
-      // The terminal writes a plain button's key before its label itself.
-      expect(pick?.props.label).toBe(surface === 'terminal' ? '☐' : '1 ☐')
+      // A desktop draws a button's key beside it, and the terminal a plain button's before it, so the label leaves
+      // it out; only the terminal's framed button needs it in its label.
+      expect(merge?.props.label).toBe(surface === 'terminal' ? 'Merge · m' : 'Merge')
+      expect(keep?.props.label).toBe(surface === 'terminal' ? 'Keep as is · k' : 'Keep as is')
+      expect(pick?.props.label).toBe('☐')
     }
     expect(merge?.props.autoFocus).toBe(true)
     await ui.unmount()
